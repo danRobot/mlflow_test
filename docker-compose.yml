@@ -1,0 +1,86 @@
+name: mlflow-stack
+
+# Lo despliega infra/deploy.sh en la EC2, que tambien genera el .env
+# (imagen de ECR, IP publica, bucket de S3). No hace falta editar nada aqui.
+
+# Rotacion de logs: MLflow registra cada peticion y el disco es de 20 GB.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # -------------------------------------------------------------------------
+  # Backend store: metadatos de experimentos, runs, parametros y metricas.
+  # No publica puertos: solo es accesible desde la red interna de Docker.
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: mlflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en .env}
+      POSTGRES_DB: mlflow
+    volumes:
+      - mlflow-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    logging: *logging
+    networks:
+      - mlflow-net
+
+  # -------------------------------------------------------------------------
+  # Servidor de tracking (UI + REST API + proxy de artefactos hacia S3).
+  # Los clientes suben los modelos por aqui; no necesitan credenciales de AWS.
+  # -------------------------------------------------------------------------
+  mlflow:
+    image: ${MLFLOW_IMAGE:?Define MLFLOW_IMAGE (imagen de ECR)}
+    container_name: mlflow-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      BACKEND_STORE_URI: postgresql+psycopg2://mlflow:${POSTGRES_PASSWORD}@postgres:5432/mlflow
+      # s3://<bucket>/artifacts. Las credenciales salen del rol de la EC2.
+      ARTIFACTS_DESTINATION: ${ARTIFACTS_DESTINATION:?Define ARTIFACTS_DESTINATION en .env}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:?Define AWS_DEFAULT_REGION en .env}
+      MLFLOW_PORT: 8080
+      MLFLOW_WORKERS: ${MLFLOW_WORKERS:-2}
+      # IP publica de la EC2. Obligatorio: sin esto MLflow 3.x rechaza las
+      # peticiones que llegan desde Colab con la IP publica.
+      MLFLOW_PUBLIC_HOST: ${MLFLOW_PUBLIC_HOST:?Define MLFLOW_PUBLIC_HOST en .env}
+      MLFLOW_PUBLIC_PORT: 8080
+      MLFLOW_AUTH_ENABLED: ${MLFLOW_AUTH_ENABLED:-false}
+      MLFLOW_AUTH_USERNAME: admin
+      MLFLOW_AUTH_PASSWORD: ${MLFLOW_AUTH_PASSWORD:-}
+      # Sin los procesos de jobs de GenAI (no se usan aqui): MLflow pasa de
+      # ~1.9 GB a ~0.6 GB de RAM y cabe en una t3.small junto a Postgres.
+      MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"
+    ports:
+      - "8080:8080"
+    volumes:
+      - mlflow-auth:/mlflow/auth
+    logging: *logging
+    networks:
+      - mlflow-net
+
+# ---------------------------------------------------------------------------
+# Volumenes en el disco de la EC2: sobreviven a reinicios y a cada deploy.
+# El workflow de destroy los borra junto con la instancia.
+# ---------------------------------------------------------------------------
+volumes:
+  mlflow-pgdata:
+    name: mlflow-pgdata
+  mlflow-auth:
+    name: mlflow-auth
+
+networks:
+  mlflow-net:
+    name: mlflow-net

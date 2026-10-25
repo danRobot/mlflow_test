@@ -1,0 +1,104 @@
+name: deploy
+
+# Crea o actualiza la infraestructura (Terraform), construye la imagen del
+# servidor en ECR si cambio infra/mlflow-server/ y la despliega en la EC2 por SSM.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # OIDC: asumir el rol de AWS sin access keys
+  contents: read
+
+# deploy y destroy nunca corren a la vez
+concurrency:
+  group: mlflow-infra
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_region: ${{ vars.AWS_REGION }}
+  TF_VAR_mlflow_auth_password: ${{ secrets.MLFLOW_AUTH_PASSWORD }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.16.7
+          terraform_wrapper: false # el wrapper ensucia la salida de `terraform output`
+
+      - name: Terraform apply
+        working-directory: infra/terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="region=${AWS_REGION}"
+          terraform apply -input=false -auto-approve
+          for name in ecr_repository_url instance_id public_ip artifacts_bucket auth_parameter; do
+            value=$(terraform output -raw "$name")
+            echo "${name^^}=${value}" >> "$GITHUB_ENV"
+          done
+
+      - name: Imagen en ECR
+        run: |
+          # El tag es el hash git de infra/mlflow-server: solo se reconstruye si cambia.
+          tag=$(git rev-parse HEAD:infra/mlflow-server)
+          image="${ECR_REPOSITORY_URL}:${tag}"
+          echo "IMAGE=${image}" >> "$GITHUB_ENV"
+          if aws ecr describe-images --repository-name "${ECR_REPOSITORY_URL#*/}" \
+              --image-ids "imageTag=${tag}" >/dev/null 2>&1; then
+            echo "La imagen ${image} ya existe; no se reconstruye."
+            exit 0
+          fi
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPOSITORY_URL%%/*}"
+          docker build -t "${image}" infra/mlflow-server
+          docker push "${image}"
+
+      - name: Deploy en la EC2 (SSM)
+        run: |
+          # compose y deploy.sh viajan por S3; la instancia los descarga y ejecuta.
+          aws s3 cp docker-compose.yml "s3://${ARTIFACTS_BUCKET}/deploy/docker-compose.yml"
+          aws s3 cp infra/deploy.sh "s3://${ARTIFACTS_BUCKET}/deploy/deploy.sh"
+
+          echo "Esperando a que la instancia se registre en SSM..."
+          status=""
+          for _ in $(seq 60); do
+            status=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
+              --query 'InstanceInformationList[0].PingStatus' --output text)
+            [ "$status" = "Online" ] && break
+            sleep 10
+          done
+          [ "$status" = "Online" ] || { echo "La instancia no aparece en SSM"; exit 1; }
+
+          cmd="mkdir -p /opt/mlflow"
+          cmd+=" && aws s3 cp s3://${ARTIFACTS_BUCKET}/deploy/ /opt/mlflow/ --recursive --quiet"
+          cmd+=" && MLFLOW_IMAGE=${IMAGE} MLFLOW_PUBLIC_HOST=${PUBLIC_IP} ARTIFACTS_BUCKET=${ARTIFACTS_BUCKET}"
+          cmd+=" AWS_REGION=${AWS_REGION} AUTH_PARAMETER=${AUTH_PARAMETER} bash /opt/mlflow/deploy.sh"
+          id=$(aws ssm send-command --instance-ids "${INSTANCE_ID}" \
+            --document-name AWS-RunShellScript --comment "deploy ${GITHUB_SHA::7}" \
+            --parameters "$(jq -cn --arg c "$cmd" '{commands: [$c]}')" \
+            --query Command.CommandId --output text)
+
+          for _ in $(seq 90); do
+            sleep 10
+            status=$(aws ssm get-command-invocation --command-id "$id" --instance-id "${INSTANCE_ID}" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$status" in Pending | InProgress | Delayed) ;; *) break ;; esac
+          done
+          aws ssm get-command-invocation --command-id "$id" --instance-id "${INSTANCE_ID}" \
+            --query '[StandardOutputContent, StandardErrorContent]' --output text
+          [ "$status" = "Success" ] || { echo "Deploy: ${status}"; exit 1; }
+
+          echo "### MLflow: http://${PUBLIC_IP}:8080" >> "$GITHUB_STEP_SUMMARY"
