@@ -1,29 +1,17 @@
 variable "project" {
-  description = "Prefijo de los nombres de los recursos"
+  description = "Prefijo de los nombres. Debe ser el mismo que en infra/bootstrap (permisos IAM)."
   type        = string
   default     = "mlflow"
 }
 
 variable "region" {
-  description = "El Learner Lab solo permite us-east-1 y us-west-2"
-  type        = string
-  default     = "us-east-1"
-
-  validation {
-    condition     = contains(["us-east-1", "us-west-2"], var.region)
-    error_message = "El Learner Lab solo permite us-east-1 y us-west-2."
-  }
+  type    = string
+  default = "us-east-1"
 }
 
 variable "instance_type" {
   type    = string
   default = "t3.small"
-}
-
-variable "instance_profile" {
-  description = "Perfil de instancia ya creado por el Learner Lab (rol LabRole)"
-  type        = string
-  default     = "LabInstanceProfile"
 }
 
 variable "allowed_cidrs" {

@@ -149,7 +149,7 @@ resource "aws_instance" "mlflow" {
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.mlflow.id]
-  iam_instance_profile   = var.instance_profile # el Learner Lab no deja crear roles
+  iam_instance_profile   = "${var.project}-ec2" # lo crea infra/bootstrap
 
   metadata_options {
     http_tokens                 = "required"
@@ -170,13 +170,7 @@ resource "aws_instance" "mlflow" {
   }
 }
 
-# El Learner Lab detiene la EC2 al terminar la sesion: cada deploy la enciende.
-resource "aws_ec2_instance_state" "mlflow" {
-  instance_id = aws_instance.mlflow.id
-  state       = "running"
-}
-
-# IP fija mientras exista el stack: se mantiene aunque la sesion detenga la EC2.
+# IP fija mientras exista el stack (sobrevive a reinicios de la instancia).
 resource "aws_eip" "mlflow" {
   domain   = "vpc"
   instance = aws_instance.mlflow.id

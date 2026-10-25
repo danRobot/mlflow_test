@@ -1,7 +1,7 @@
 name: destroy
 
-# Borra TODO: servidor, base de datos (runs y metricas), modelos en S3,
-# imagenes en ECR y el bucket del estado de Terraform. La cuenta queda vacia.
+# Borra TODO lo que crea Terraform: servidor, base de datos (runs y metricas),
+# modelos en S3 e imagenes en ECR. El bootstrap (estado y rol de GitHub) se queda.
 on:
   workflow_dispatch:
     inputs:
@@ -11,6 +11,7 @@ on:
         type: string
 
 permissions:
+  id-token: write
   contents: read
 
 concurrency:
@@ -18,13 +19,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
   TF_IN_AUTOMATION: "true"
-  TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_VAR_region: ${{ vars.AWS_REGION }}
   TF_VAR_mlflow_auth_password: ${{ secrets.MLFLOW_AUTH_PASSWORD }}
 
 jobs:
@@ -35,26 +33,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.16.7
 
-      - name: Terraform destroy y bucket del estado
+      - name: Terraform destroy
         working-directory: infra/terraform
         run: |
-          if ! account=$(aws sts get-caller-identity --query Account --output text); then
-            echo "::error::Credenciales invalidas o caducadas. Copia de nuevo los tres valores de AWS Details del Learner Lab a los secrets."
-            exit 1
-          fi
-          echo "::add-mask::${account}"
-          bucket="mlflow-tfstate-${account}-${AWS_REGION}"
-          if ! aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
-            echo "No existe el bucket del estado: no hay nada desplegado."
-            exit 0
-          fi
           terraform init -input=false \
-            -backend-config="bucket=${bucket}" \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="region=${AWS_REGION}"
           terraform destroy -input=false -auto-approve
-          # Solo se llega aqui si destroy termino bien: el estado ya esta vacio.
-          aws s3 rb "s3://${bucket}" --force

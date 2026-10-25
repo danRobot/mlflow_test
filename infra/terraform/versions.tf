@@ -8,8 +8,8 @@ terraform {
     }
   }
 
-  # Estado en S3, en un bucket que crea el workflow de deploy y borra el de
-  # destroy. El workflow pasa bucket y region con `terraform init -backend-config=...`.
+  # Estado en el bucket que crea infra/bootstrap. El workflow pasa bucket y
+  # region con `terraform init -backend-config=...`.
   backend "s3" {
     key          = "mlflow/terraform.tfstate"
     encrypt      = true

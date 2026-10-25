@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  id-token: write # OIDC: asumir el rol de AWS sin access keys
   contents: read
 
 # deploy y destroy nunca corren a la vez
@@ -13,16 +14,11 @@ concurrency:
   group: mlflow-infra
   cancel-in-progress: false
 
-# Credenciales del Learner Lab (AWS Details). Caducan con cada sesion:
-# actualiza los tres secrets antes de lanzar el workflow.
 env:
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
   TF_IN_AUTOMATION: "true"
-  TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_VAR_region: ${{ vars.AWS_REGION }}
   TF_VAR_mlflow_auth_password: ${{ secrets.MLFLOW_AUTH_PASSWORD }}
 
 jobs:
@@ -32,29 +28,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.16.7
           terraform_wrapper: false # el wrapper ensucia la salida de `terraform output`
-
-      - name: Credenciales y bucket del estado
-        run: |
-          if ! account=$(aws sts get-caller-identity --query Account --output text); then
-            echo "::error::Credenciales invalidas o caducadas. Copia de nuevo los tres valores de AWS Details del Learner Lab a los secrets."
-            exit 1
-          fi
-          echo "::add-mask::${account}"
-          bucket="mlflow-tfstate-${account}-${AWS_REGION}"
-          echo "TF_STATE_BUCKET=${bucket}" >> "$GITHUB_ENV"
-          if ! aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
-            if [ "$AWS_REGION" = us-east-1 ]; then
-              aws s3api create-bucket --bucket "$bucket" >/dev/null
-            else
-              aws s3api create-bucket --bucket "$bucket" \
-                --create-bucket-configuration "LocationConstraint=${AWS_REGION}" >/dev/null
-            fi
-            echo "Bucket del estado creado."
-          fi
 
       - name: Terraform apply
         working-directory: infra/terraform
