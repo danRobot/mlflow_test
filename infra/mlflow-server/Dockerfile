@@ -9,7 +9,7 @@ FROM python:3.11-slim
 COPY --from=ghcr.io/astral-sh/uv:0.12.10 /uv /bin/uv
 
 # Manten esta version alineada con la que instalas en Colab.
-ARG MLFLOW_VERSION=3.16.0
+ARG MLFLOW_VERSION=3.17.0
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
