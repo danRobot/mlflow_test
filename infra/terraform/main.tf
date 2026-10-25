@@ -1,5 +1,3 @@
-data "aws_caller_identity" "current" {}
-
 # Amazon Linux 2023: trae el agente de SSM y la AWS CLI instalados.
 data "aws_ami" "al2023" {
   most_recent = true
@@ -104,21 +102,25 @@ resource "aws_security_group" "mlflow" {
 }
 
 # ---------------------------------------------------------------------------
-# Artefactos (modelos) en S3. force_destroy: destroy lo vacia y lo borra.
-#   artifacts/ -> lo que guarda MLflow
-#   deploy/    -> compose y deploy.sh que sube el workflow
+# El bucket de artefactos NO lo gestiona Terraform: el provider lee siempre su
+# configuracion de Object Lock y la politica (SCP) del Learner Lab lo prohibe.
+# Lo crea el workflow de deploy con la CLI y lo borra el de destroy.
+#
+# Estos bloques sacan del estado el bucket de versiones anteriores sin leerlo
+# ni borrarlo. Se pueden quitar cuando ya no quede ningun estado antiguo.
 # ---------------------------------------------------------------------------
-resource "aws_s3_bucket" "artifacts" {
-  bucket        = "${var.project}-artifacts-${data.aws_caller_identity.current.account_id}-${var.region}"
-  force_destroy = true
+removed {
+  from = aws_s3_bucket.artifacts
+  lifecycle {
+    destroy = false
+  }
 }
 
-resource "aws_s3_bucket_public_access_block" "artifacts" {
-  bucket                  = aws_s3_bucket.artifacts.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+removed {
+  from = aws_s3_bucket_public_access_block.artifacts
+  lifecycle {
+    destroy = false
+  }
 }
 
 # ---------------------------------------------------------------------------

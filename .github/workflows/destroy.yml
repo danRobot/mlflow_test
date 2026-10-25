@@ -39,22 +39,33 @@ jobs:
         with:
           terraform_version: 1.16.7
 
-      - name: Terraform destroy y bucket del estado
+      - name: Terraform destroy y buckets
         working-directory: infra/terraform
         run: |
-          if ! account=$(aws sts get-caller-identity --query Account --output text); then
+          if ! ident=$(aws sts get-caller-identity --query '[Account, Arn]' --output text); then
             echo "::error::Credenciales invalidas o caducadas. Copia de nuevo los tres valores de AWS Details del Learner Lab a los secrets."
             exit 1
           fi
+          account=${ident%%[[:space:]]*}
+          arn=${ident##*[[:space:]]}
           echo "::add-mask::${account}"
-          bucket="mlflow-tfstate-${account}-${AWS_REGION}"
-          if ! aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
-            echo "No existe el bucket del estado: no hay nada desplegado."
-            exit 0
+          echo "::add-mask::${arn##*/}" # sesion del lab: lleva tu nombre
+          state="mlflow-tfstate-${account}-${AWS_REGION}"
+          artifacts="mlflow-artifacts-${account}-${AWS_REGION}"
+
+          if aws s3api head-bucket --bucket "$state" 2>/dev/null; then
+            terraform init -input=false \
+              -backend-config="bucket=${state}" \
+              -backend-config="region=${AWS_REGION}"
+            terraform destroy -input=false -auto-approve
+          else
+            echo "No existe el bucket del estado: no hay stack que destruir."
           fi
-          terraform init -input=false \
-            -backend-config="bucket=${bucket}" \
-            -backend-config="region=${AWS_REGION}"
-          terraform destroy -input=false -auto-approve
-          # Solo se llega aqui si destroy termino bien: el estado ya esta vacio.
-          aws s3 rb "s3://${bucket}" --force
+
+          # Solo se llega aqui si destroy termino bien. Los buckets van al final:
+          # el de artefactos con los modelos y el del estado, ya vacio.
+          for bucket in "$artifacts" "$state"; do
+            if aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
+              aws s3 rb "s3://${bucket}" --force
+            fi
+          done
