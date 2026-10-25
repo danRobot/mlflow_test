@@ -19,3 +19,8 @@ output "auth_parameter" {
   description = "Parametro SSM con la clave de la UI (vacio si no hay auth)"
   value       = try(aws_ssm_parameter.auth[0].name, "")
 }
+
+output "log_group" {
+  description = "Log group de CloudWatch con apagados y errores de memoria de la EC2"
+  value       = aws_cloudwatch_log_group.ec2.name
+}

@@ -186,3 +186,50 @@ resource "aws_eip" "mlflow" {
 
   depends_on = [aws_internet_gateway.this]
 }
+
+# ---------------------------------------------------------------------------
+# Registro de errores en CloudWatch Logs al minimo costo: sin metricas, sin
+# alarmas y sin agente. Solo llegan eventos sueltos de ~1 KB, y CloudWatch Logs
+# cobra US$0.50 por GB ingerido: fracciones de centavo al mes.
+#   - Apagados de la EC2 (stopping, stopped, shutting-down, terminated):
+#     EventBridge, gratis para eventos de AWS dentro de la misma cuenta.
+#   - Falta de memoria (OOM killer): lo envia infra/oom-alert.sh desde la EC2.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_log_group" "ec2" {
+  name              = "/${var.project}/ec2"
+  retention_in_days = 7
+}
+
+resource "aws_cloudwatch_event_rule" "ec2_state" {
+  name        = "${var.project}-ec2-apagado"
+  description = "Apagados y terminaciones de la EC2 de MLflow"
+
+  event_pattern = jsonencode({
+    source        = ["aws.ec2"]
+    "detail-type" = ["EC2 Instance State-change Notification"]
+    detail = {
+      "instance-id" = [aws_instance.mlflow.id]
+      state         = ["stopping", "stopped", "shutting-down", "terminated"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "ec2_state" {
+  rule = aws_cloudwatch_event_rule.ec2_state.name
+  arn  = aws_cloudwatch_log_group.ec2.arn
+}
+
+# Permite a EventBridge escribir en el log group (politica de recurso, sin roles).
+resource "aws_cloudwatch_log_resource_policy" "eventbridge" {
+  policy_name = "${var.project}-eventbridge"
+
+  policy_document = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = ["events.amazonaws.com", "delivery.logs.amazonaws.com"] }
+      Action    = ["logs:CreateLogStream", "logs:PutLogEvents"]
+      Resource  = "${aws_cloudwatch_log_group.ec2.arn}:*"
+    }]
+  })
+}

@@ -26,13 +26,24 @@ Las credenciales cambian cada vez que inicias el lab y caducan cuando termina la
 
 ## 3. Desplegar y destruir
 
-- **Actions → deploy → Run workflow**: crea o actualiza todo y despliega. La URL aparece en el resumen del run. Si la sesión anterior detuvo la EC2, el deploy la vuelve a encender.
-- **Actions → destroy → Run workflow**, escribiendo `destroy`: borra todo, incluidos runs, métricas, modelos, imágenes y el bucket del estado. La cuenta queda vacía.
+- **Actions → deploy → Run workflow**: etapas `config` (credenciales y buckets) → `terraform` → `build` (imagen en ECR) → `deploy` (EC2 por SSM). La URL aparece en el resumen del run. Si la sesión anterior detuvo la EC2, el deploy la vuelve a encender.
+- **Actions → destroy → Run workflow**, escribiendo `destroy`: etapas `config` → `terraform` → `buckets`. Borra todo, incluidos runs, métricas, modelos, imágenes, logs y el bucket del estado. La cuenta queda vacía.
+
+Las dos etapas `config` fallan si las credenciales no sirven (caducadas, revocadas al reiniciar el lab o mal copiadas), en vez de seguir como si no hubiera nada desplegado.
+
+## Registro de errores (CloudWatch)
+
+En el log group `/mlflow/ec2` (CloudWatch → Log groups), con 7 días de retención:
+
+- **Apagados** de la EC2 (`stopping`, `stopped`, `shutting-down`, `terminated`), vía EventBridge.
+- **Falta de memoria** (líneas del OOM killer del kernel), en el stream `oom`, enviadas por un servicio de la EC2.
+
+No hay métricas, alarmas ni agente de CloudWatch, que sí tienen costo fijo: solo eventos sueltos de ~1 KB, así que cuesta fracciones de centavo al mes. Para saber **quién** detuvo la instancia, usa CloudTrail → Historial de eventos (`StopInstances`), que es gratis.
 
 Al terminar la sesión el lab detiene la EC2, pero la IP es fija (Elastic IP) y los datos se conservan. En la sesión siguiente, lanza deploy (o enciende la instancia desde la consola de EC2) y MLflow vuelve con la misma IP. La IP solo cambia después de un destroy o de un reset del lab.
 
 Con clave activada, define en el notebook `MLFLOW_TRACKING_USERNAME=admin` y `MLFLOW_TRACKING_PASSWORD`. La clave se fija cuando se crea el servidor: cambiar el secret después no la cambia. MLflow va por HTTP, así que la clave viaja sin cifrar.
 
-Gasto aproximado del crédito del lab: unos US$0.03 por hora con la EC2 encendida (t3.small, IP y disco) y menos de US$0.01 por hora con ella detenida (la IP y el disco se siguen cobrando). Haz destroy cuando ya no lo necesites.
+Gasto aproximado del crédito del lab: unos US$0.03 por hora con la EC2 encendida si es t3.small (IP y disco incluidos; una m7i-flex.large ronda los US$0.10 por hora) y menos de US$0.01 por hora con ella detenida (la IP y el disco se siguen cobrando). Haz destroy cuando ya no lo necesites.
 
 Para entrar a la instancia: `aws ssm start-session --target <instance_id>` (requiere el plugin de Session Manager), o desde la consola de EC2 con **Connect → Session Manager**.

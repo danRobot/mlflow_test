@@ -5,6 +5,7 @@ set -euo pipefail
 
 : "${MLFLOW_IMAGE:?}" "${MLFLOW_PUBLIC_HOST:?}" "${ARTIFACTS_BUCKET:?}" "${AWS_REGION:?}"
 AUTH_PARAMETER="${AUTH_PARAMETER:-}"
+LOG_GROUP="${LOG_GROUP:-}"
 COMPOSE_VERSION=v2.40.3
 export HOME="${HOME:-/root}" # SSM no siempre define HOME y docker lo necesita
 cd /opt/mlflow
@@ -51,7 +52,29 @@ docker compose pull --quiet
 docker compose up -d --remove-orphans
 docker image prune -af >/dev/null # imagenes de deploys anteriores
 
-# 4) Espera a que MLflow responda (hasta 5 minutos)
+# 4) Servicio que envia a CloudWatch Logs los avisos de falta de memoria (OOM)
+if [ -n "$LOG_GROUP" ]; then
+    cat >/etc/systemd/system/mlflow-oom-alert.service <<EOF
+[Unit]
+Description=Envia a CloudWatch Logs los avisos de falta de memoria (OOM)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=LOG_GROUP=${LOG_GROUP} AWS_REGION=${AWS_REGION}
+ExecStart=/bin/bash /opt/mlflow/oom-alert.sh
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable mlflow-oom-alert >/dev/null 2>&1
+    systemctl restart mlflow-oom-alert
+fi
+
+# 5) Espera a que MLflow responda (hasta 5 minutos)
 for _ in $(seq 60); do
     if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
         echo "MLflow listo: http://${MLFLOW_PUBLIC_HOST}:8080"

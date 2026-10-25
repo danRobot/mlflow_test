@@ -1,7 +1,8 @@
 name: destroy
 
+# Etapas: config -> terraform (destroy) -> buckets
 # Borra TODO: servidor, base de datos (runs y metricas), modelos en S3,
-# imagenes en ECR y el bucket del estado de Terraform. La cuenta queda vacia.
+# imagenes en ECR, logs y el bucket del estado. La cuenta queda vacia.
 on:
   workflow_dispatch:
     inputs:
@@ -28,44 +29,69 @@ env:
   TF_VAR_mlflow_auth_password: ${{ secrets.MLFLOW_AUTH_PASSWORD }}
 
 jobs:
-  destroy:
-    if: inputs.confirm == 'destroy'
+  config:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      has_state: ${{ steps.state.outputs.has_state }}
+    steps:
+      - name: Confirmacion
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != destroy ]; then
+            echo "::error::Escribe destroy en el campo de confirmacion para borrar todo."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
+
+      - name: Estado de Terraform
+        id: state
+        run: |
+          echo "has_state=${STATE_BUCKET_EXISTS}" >> "$GITHUB_OUTPUT"
+          if [ "$STATE_BUCKET_EXISTS" != true ]; then
+            echo "No existe el bucket del estado: no hay stack que destruir."
+          fi
+
+  terraform:
+    needs: config
+    if: needs.config.outputs.has_state == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
 
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.16.7
 
-      - name: Terraform destroy y buckets
+      - name: Terraform destroy
         working-directory: infra/terraform
         run: |
-          if ! ident=$(aws sts get-caller-identity --query '[Account, Arn]' --output text); then
-            echo "::error::Credenciales invalidas o caducadas. Copia de nuevo los tres valores de AWS Details del Learner Lab a los secrets."
-            exit 1
-          fi
-          account=${ident%%[[:space:]]*}
-          arn=${ident##*[[:space:]]}
-          echo "::add-mask::${account}"
-          echo "::add-mask::${arn##*/}" # sesion del lab: lleva tu nombre
-          state="mlflow-tfstate-${account}-${AWS_REGION}"
-          artifacts="mlflow-artifacts-${account}-${AWS_REGION}"
+          terraform init -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="region=${AWS_REGION}"
+          terraform destroy -input=false -auto-approve
 
-          if aws s3api head-bucket --bucket "$state" 2>/dev/null; then
-            terraform init -input=false \
-              -backend-config="bucket=${state}" \
-              -backend-config="region=${AWS_REGION}"
-            terraform destroy -input=false -auto-approve
-          else
-            echo "No existe el bucket del estado: no hay stack que destruir."
-          fi
+  # Corre si terraform termino bien o se salto porque no habia estado.
+  buckets:
+    needs: [config, terraform]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
 
-          # Solo se llega aqui si destroy termino bien. Los buckets van al final:
-          # el de artefactos con los modelos y el del estado, ya vacio.
-          for bucket in "$artifacts" "$state"; do
-            if aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
-              aws s3 rb "s3://${bucket}" --force
-            fi
-          done
+      - name: Borrar buckets
+        run: |
+          # Artefactos (modelos) primero; el del estado al final, ya vacio.
+          if [ "$ARTIFACTS_BUCKET_EXISTS" = true ]; then
+            aws s3 rb "s3://${ARTIFACTS_BUCKET}" --force
+          fi
+          if [ "$STATE_BUCKET_EXISTS" = true ]; then
+            aws s3 rb "s3://${TF_STATE_BUCKET}" --force
+          fi
