@@ -41,4 +41,14 @@ Costo aproximado en us-east-1 con el stack desplegado: unos US$20 al mes (t3.sma
 
 El rol de GitHub puede gestionar EC2, ECR y SSM en toda la cuenta (de IAM solo pasar el rol de la instancia): lo ideal es una cuenta dedicada a esto.
 
+## 4. Dejar la cuenta vacía
+
+Desde tu máquina, con las mismas credenciales de administrador del bootstrap:
+
+```bash
+bash infra/unapply.sh
+```
+
+Borra el stack de MLflow si sigue en pie, vacía y borra el bucket del estado, y destruye el bootstrap (proveedor OIDC y roles). Pide escribir `borrar` y se cancela si tus credenciales son de otra cuenta. Se puede repetir si falla a medias. No toca nada que no haya creado este proyecto.
+
 Para entrar a la instancia: `aws ssm start-session --target <instance_id>` (requiere el plugin de Session Manager).
