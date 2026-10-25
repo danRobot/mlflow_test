@@ -15,9 +15,9 @@ output "ecr_repository_url" {
   value = aws_ecr_repository.mlflow.repository_url
 }
 
-output "auth_parameter" {
-  description = "Parametro SSM con la clave de la UI (vacio si no hay auth)"
-  value       = try(aws_ssm_parameter.auth[0].name, "")
+output "postgres_parameter" {
+  description = "Parametro SSM con la clave de Postgres"
+  value       = aws_ssm_parameter.postgres.name
 }
 
 output "log_group" {

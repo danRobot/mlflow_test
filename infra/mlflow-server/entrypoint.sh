@@ -7,7 +7,6 @@ MLFLOW_PORT="${MLFLOW_PORT:-8080}"
 MLFLOW_PUBLIC_PORT="${MLFLOW_PUBLIC_PORT:-${MLFLOW_PORT}}"
 MLFLOW_PUBLIC_HOST="${MLFLOW_PUBLIC_HOST:-}"
 MLFLOW_WORKERS="${MLFLOW_WORKERS:-2}"
-MLFLOW_AUTH_ENABLED="${MLFLOW_AUTH_ENABLED:-false}"
 
 # No hay bucle de espera: el 'depends_on: condition: service_healthy' del
 # compose garantiza que Postgres ya acepta conexiones.
@@ -43,32 +42,7 @@ SERVER_ARGS=(
     --cors-allowed-origins "${CORS_ORIGINS}"
 )
 
-if [ "${MLFLOW_AUTH_ENABLED,,}" = "true" ]; then
-    : "${MLFLOW_AUTH_PASSWORD:?Falta MLFLOW_AUTH_PASSWORD}"
-
-    # MLflow 3.x no arranca basic-auth sin una clave fija para CSRF, comun a
-    # todos los workers. Se genera una vez y se guarda en el volumen de auth.
-    SECRET_FILE=/mlflow/auth/flask_secret_key
-    [ -s "${SECRET_FILE}" ] || python -c 'import secrets; print(secrets.token_hex(32))' > "${SECRET_FILE}"
-    chmod 600 "${SECRET_FILE}"
-    MLFLOW_FLASK_SERVER_SECRET_KEY="${MLFLOW_FLASK_SERVER_SECRET_KEY:-$(cat "${SECRET_FILE}")}"
-    export MLFLOW_FLASK_SERVER_SECRET_KEY
-
-    # El .ini se lee con configparser, que interpreta '%': se duplica.
-    cat > /mlflow/auth/basic_auth.ini <<INI
-[mlflow]
-default_permission = READ
-database_uri = sqlite:////mlflow/auth/basic_auth.db
-admin_username = ${MLFLOW_AUTH_USERNAME:-admin}
-admin_password = ${MLFLOW_AUTH_PASSWORD//%/%%}
-authorization_function = mlflow.server.auth:authenticate_request_basic_auth
-INI
-    chmod 600 /mlflow/auth/basic_auth.ini
-    export MLFLOW_AUTH_CONFIG_PATH=/mlflow/auth/basic_auth.ini
-    SERVER_ARGS+=(--app-name basic-auth)
-fi
-
-echo "[entrypoint] auth=${MLFLOW_AUTH_ENABLED} hosts=${ALLOWED_HOSTS}"
+echo "[entrypoint] hosts=${ALLOWED_HOSTS}"
 echo "[entrypoint] cors=${CORS_ORIGINS} artifacts=${ARTIFACTS_DESTINATION}"
 
 exec mlflow "${SERVER_ARGS[@]}"

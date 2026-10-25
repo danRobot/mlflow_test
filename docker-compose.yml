@@ -57,16 +57,11 @@ services:
       # peticiones que llegan desde Colab con la IP publica.
       MLFLOW_PUBLIC_HOST: ${MLFLOW_PUBLIC_HOST:?Define MLFLOW_PUBLIC_HOST en .env}
       MLFLOW_PUBLIC_PORT: 8080
-      MLFLOW_AUTH_ENABLED: ${MLFLOW_AUTH_ENABLED:-false}
-      MLFLOW_AUTH_USERNAME: admin
-      MLFLOW_AUTH_PASSWORD: ${MLFLOW_AUTH_PASSWORD:-}
       # Sin los procesos de jobs de GenAI (no se usan aqui): MLflow pasa de
       # ~1.9 GB a ~0.6 GB de RAM y cabe en una t3.small junto a Postgres.
       MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"
     ports:
       - "8080:8080"
-    volumes:
-      - mlflow-auth:/mlflow/auth
     logging: *logging
     networks:
       - mlflow-net
@@ -78,8 +73,6 @@ services:
 volumes:
   mlflow-pgdata:
     name: mlflow-pgdata
-  mlflow-auth:
-    name: mlflow-auth
 
 networks:
   mlflow-net:

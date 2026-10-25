@@ -32,14 +32,16 @@ variable "allowed_cidrs" {
   default     = ["0.0.0.0/0"]
 }
 
-variable "mlflow_auth_password" {
-  description = "Si no esta vacio activa usuario y clave en MLflow (usuario admin). Viene del secret de GitHub."
+variable "postgres_password" {
+  description = "Clave del usuario mlflow de Postgres. Viene del secret POSTGRES_PASSWORD de GitHub (el deploy lo exige; destroy no lo necesita)."
   type        = string
   default     = ""
   sensitive   = true
 
+  # Va dentro de la URL de conexion de MLflow: se limitan los caracteres para
+  # no tener que escaparla.
   validation {
-    condition     = var.mlflow_auth_password == "" || length(var.mlflow_auth_password) >= 12
-    error_message = "MLFLOW_AUTH_PASSWORD debe tener al menos 12 caracteres (lo exige MLflow)."
+    condition     = var.postgres_password == "" || can(regex("^[A-Za-z0-9._~-]{8,}$", var.postgres_password))
+    error_message = "POSTGRES_PASSWORD: al menos 8 caracteres, solo letras, numeros y . _ ~ -"
   }
 }

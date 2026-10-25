@@ -26,7 +26,6 @@ env:
   AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   TF_IN_AUTOMATION: "true"
   TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
-  TF_VAR_mlflow_auth_password: ${{ secrets.MLFLOW_AUTH_PASSWORD }}
 
 jobs:
   config:

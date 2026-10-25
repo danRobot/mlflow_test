@@ -132,14 +132,14 @@ resource "aws_ecr_repository" "mlflow" {
   force_delete         = true
 }
 
-# Clave de la UI (opcional). Write-only: no queda guardada en el estado.
-# La instancia la lee en cada deploy.
-resource "aws_ssm_parameter" "auth" {
-  count            = nonsensitive(var.mlflow_auth_password != "") ? 1 : 0
-  name             = "/${var.project}/auth-password"
+# Clave de Postgres (secret POSTGRES_PASSWORD). Write-only: no queda en el
+# estado. La version sale de un hash de la clave, asi que cambiar el secret
+# actualiza el parametro; deploy.sh lo lee y fija la clave en la base.
+resource "aws_ssm_parameter" "postgres" {
+  name             = "/${var.project}/postgres-password"
   type             = "SecureString"
-  value_wo         = var.mlflow_auth_password
-  value_wo_version = 1
+  value_wo         = var.postgres_password
+  value_wo_version = parseint(substr(sha256(var.postgres_password), 0, 8), 16)
 }
 
 # ---------------------------------------------------------------------------

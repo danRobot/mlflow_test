@@ -22,13 +22,20 @@ env:
   AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   TF_IN_AUTOMATION: "true"
   TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
-  TF_VAR_mlflow_auth_password: ${{ secrets.MLFLOW_AUTH_PASSWORD }}
+  TF_VAR_postgres_password: ${{ secrets.POSTGRES_PASSWORD }}
 
 jobs:
   config:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Secret POSTGRES_PASSWORD
+        run: |
+          if [ -z "$TF_VAR_postgres_password" ]; then
+            echo "::error::Falta el secret POSTGRES_PASSWORD (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
       - uses: ./.github/actions/aws-setup
 
@@ -55,7 +62,7 @@ jobs:
     outputs:
       instance_id: ${{ steps.apply.outputs.instance_id }}
       public_ip: ${{ steps.apply.outputs.public_ip }}
-      auth_parameter: ${{ steps.apply.outputs.auth_parameter }}
+      postgres_parameter: ${{ steps.apply.outputs.postgres_parameter }}
       log_group: ${{ steps.apply.outputs.log_group }}
     steps:
       - uses: actions/checkout@v7
@@ -74,7 +81,7 @@ jobs:
             -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="region=${AWS_REGION}"
           terraform apply -input=false -auto-approve
-          for name in instance_id public_ip auth_parameter log_group; do
+          for name in instance_id public_ip postgres_parameter log_group; do
             echo "${name}=$(terraform output -raw "$name")" >> "$GITHUB_OUTPUT"
           done
 
@@ -110,7 +117,7 @@ jobs:
     env:
       INSTANCE_ID: ${{ needs.terraform.outputs.instance_id }}
       PUBLIC_IP: ${{ needs.terraform.outputs.public_ip }}
-      AUTH_PARAMETER: ${{ needs.terraform.outputs.auth_parameter }}
+      POSTGRES_PARAMETER: ${{ needs.terraform.outputs.postgres_parameter }}
       LOG_GROUP: ${{ needs.terraform.outputs.log_group }}
       IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
     steps:
@@ -139,7 +146,7 @@ jobs:
           cmd+=" && aws s3 cp s3://${ARTIFACTS_BUCKET}/deploy/ /opt/mlflow/ --recursive --quiet"
           cmd+=" && MLFLOW_IMAGE=${ECR_REPOSITORY}:${IMAGE_TAG} MLFLOW_PUBLIC_HOST=${PUBLIC_IP}"
           cmd+=" ARTIFACTS_BUCKET=${ARTIFACTS_BUCKET} AWS_REGION=${AWS_REGION}"
-          cmd+=" AUTH_PARAMETER=${AUTH_PARAMETER} LOG_GROUP=${LOG_GROUP} bash /opt/mlflow/deploy.sh"
+          cmd+=" POSTGRES_PARAMETER=${POSTGRES_PARAMETER} LOG_GROUP=${LOG_GROUP} bash /opt/mlflow/deploy.sh"
           id=$(aws ssm send-command --instance-ids "${INSTANCE_ID}" \
             --document-name AWS-RunShellScript --comment "deploy ${GITHUB_SHA::7}" \
             --parameters "$(jq -cn --arg c "$cmd" '{commands: [$c]}')" \
