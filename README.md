@@ -1,54 +1,38 @@
-# MLflow en AWS con Terraform y GitHub Actions
+# MLflow en AWS Learner Lab con Terraform y GitHub Actions
 
 | Pieza | Qué hace |
 |---|---|
 | **ECR** | Imagen del servidor (`infra/mlflow-server`). El workflow la construye solo cuando esa carpeta cambia. |
-| **EC2** | Amazon Linux 2023 con Docker Compose: MLflow + Postgres. Sin SSH: el deploy entra por SSM. |
+| **EC2** | Amazon Linux 2023 con Docker Compose: MLflow + Postgres. Usa el `LabInstanceProfile` del lab (el Learner Lab no deja crear roles). Sin SSH: el deploy entra por SSM. |
 | **S3** | Modelos y artefactos de MLflow (`s3://<bucket>/artifacts`) y estado de Terraform. |
 
-## 1. Bootstrap (una sola vez, desde tu máquina)
+No hay bootstrap: el workflow de deploy crea el bucket del estado si no existe y el de destroy lo borra al final.
 
-Crea el bucket del estado, el rol que GitHub Actions asume por OIDC (sin access keys) y el rol de la instancia EC2.
-Necesitas Terraform 1.11 o superior y credenciales de administrador de la cuenta.
-
-```bash
-cd infra/bootstrap
-terraform init
-terraform apply -var github_repo=<owner>/<repo>
-```
-
-- Si la cuenta ya tiene el proveedor OIDC de GitHub, añade `-var create_oidc_provider=false`.
-- Si tu rama principal no es `main`, añade `-var github_branch=<rama>`.
-- Guarda el `terraform.tfstate` que queda en esa carpeta. No se sube al repo.
-
-## 2. Configurar GitHub
+## 1. Configurar GitHub (una vez)
 
 En **Settings → Secrets and variables → Actions**:
 
-- **Variables**: `AWS_REGION`, `AWS_ROLE_ARN` y `TF_STATE_BUCKET`, con los valores del output `github_variables` del bootstrap.
+- **Secrets** `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` y `AWS_SESSION_TOKEN`: en el Learner Lab, **AWS Details → AWS CLI → Show**, copia cada valor.
 - **Secret opcional** `MLFLOW_AUTH_PASSWORD`: activa usuario y clave en MLflow (usuario `admin`, clave de al menos 12 caracteres).
+- **Variable opcional** `AWS_REGION`: `us-east-1` (por defecto) o `us-west-2`, las únicas que permite el lab.
+
+## 2. En cada sesión del lab
+
+Las credenciales cambian cada vez que inicias el lab y caducan cuando termina la sesión (unas 4 horas).
+
+1. **Start Lab** y espera a que el indicador esté en verde.
+2. Actualiza los tres secrets `AWS_*` con los valores nuevos de **AWS Details**.
+3. Lanza el workflow que necesites.
 
 ## 3. Desplegar y destruir
 
-- **Actions → deploy → Run workflow**: crea o actualiza todo y despliega. La URL aparece en el resumen del run.
-- **Actions → destroy → Run workflow**, escribiendo `destroy`: borra todo, incluidos runs, métricas, modelos e imágenes. El bootstrap (estado y roles, sin costo) se queda.
+- **Actions → deploy → Run workflow**: crea o actualiza todo y despliega. La URL aparece en el resumen del run. Si la sesión anterior detuvo la EC2, el deploy la vuelve a encender.
+- **Actions → destroy → Run workflow**, escribiendo `destroy`: borra todo, incluidos runs, métricas, modelos, imágenes y el bucket del estado. La cuenta queda vacía.
 
-Después de un destroy, el siguiente deploy tiene IP nueva: cámbiala en el notebook (`ip='<IP>:8080'`).
+Al terminar la sesión el lab detiene la EC2, pero la IP es fija (Elastic IP) y los datos se conservan. En la sesión siguiente, lanza deploy (o enciende la instancia desde la consola de EC2) y MLflow vuelve con la misma IP. La IP solo cambia después de un destroy o de un reset del lab.
 
-Con clave activada, define en el notebook `MLFLOW_TRACKING_USERNAME=admin` y `MLFLOW_TRACKING_PASSWORD`. La clave se fija cuando se crea el servidor: cambiar el secret después no la cambia (haz destroy y deploy, o cámbiala desde MLflow). MLflow va por HTTP, así que la clave viaja sin cifrar.
+Con clave activada, define en el notebook `MLFLOW_TRACKING_USERNAME=admin` y `MLFLOW_TRACKING_PASSWORD`. La clave se fija cuando se crea el servidor: cambiar el secret después no la cambia. MLflow va por HTTP, así que la clave viaja sin cifrar.
 
-Costo aproximado en us-east-1 con el stack desplegado: unos US$20 al mes (t3.small, IP pública y 20 GB de disco). Después de destroy, casi cero (solo el bucket del estado).
+Gasto aproximado del crédito del lab: unos US$0.03 por hora con la EC2 encendida (t3.small, IP y disco) y menos de US$0.01 por hora con ella detenida (la IP y el disco se siguen cobrando). Haz destroy cuando ya no lo necesites.
 
-El rol de GitHub puede gestionar EC2, ECR y SSM en toda la cuenta (de IAM solo pasar el rol de la instancia): lo ideal es una cuenta dedicada a esto.
-
-## 4. Dejar la cuenta vacía
-
-Desde tu máquina, con las mismas credenciales de administrador del bootstrap:
-
-```bash
-bash infra/unapply.sh
-```
-
-Borra el stack de MLflow si sigue en pie, vacía y borra el bucket del estado, y destruye el bootstrap (proveedor OIDC y roles). Pide escribir `borrar` y se cancela si tus credenciales son de otra cuenta. Se puede repetir si falla a medias. No toca nada que no haya creado este proyecto.
-
-Para entrar a la instancia: `aws ssm start-session --target <instance_id>` (requiere el plugin de Session Manager).
+Para entrar a la instancia: `aws ssm start-session --target <instance_id>` (requiere el plugin de Session Manager), o desde la consola de EC2 con **Connect → Session Manager**.
