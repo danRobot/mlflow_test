@@ -24,3 +24,8 @@ output "log_group" {
   description = "Log group de CloudWatch con apagados y errores de memoria de la EC2"
   value       = aws_cloudwatch_log_group.ec2.name
 }
+
+output "server_log_group" {
+  description = "Log group de CloudWatch con la salida de MLflow: accesos con IP remota y errores"
+  value       = aws_cloudwatch_log_group.server.name
+}

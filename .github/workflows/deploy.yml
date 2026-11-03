@@ -64,6 +64,7 @@ jobs:
       public_ip: ${{ steps.apply.outputs.public_ip }}
       postgres_parameter: ${{ steps.apply.outputs.postgres_parameter }}
       log_group: ${{ steps.apply.outputs.log_group }}
+      server_log_group: ${{ steps.apply.outputs.server_log_group }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/aws-setup
@@ -81,7 +82,7 @@ jobs:
             -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="region=${AWS_REGION}"
           terraform apply -input=false -auto-approve
-          for name in instance_id public_ip postgres_parameter log_group; do
+          for name in instance_id public_ip postgres_parameter log_group server_log_group; do
             echo "${name}=$(terraform output -raw "$name")" >> "$GITHUB_OUTPUT"
           done
 
@@ -119,6 +120,7 @@ jobs:
       PUBLIC_IP: ${{ needs.terraform.outputs.public_ip }}
       POSTGRES_PARAMETER: ${{ needs.terraform.outputs.postgres_parameter }}
       LOG_GROUP: ${{ needs.terraform.outputs.log_group }}
+      SERVER_LOG_GROUP: ${{ needs.terraform.outputs.server_log_group }}
       IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
     steps:
       - uses: actions/checkout@v7
@@ -146,7 +148,8 @@ jobs:
           cmd+=" && aws s3 cp s3://${ARTIFACTS_BUCKET}/deploy/ /opt/mlflow/ --recursive --quiet"
           cmd+=" && MLFLOW_IMAGE=${ECR_REPOSITORY}:${IMAGE_TAG} MLFLOW_PUBLIC_HOST=${PUBLIC_IP}"
           cmd+=" ARTIFACTS_BUCKET=${ARTIFACTS_BUCKET} AWS_REGION=${AWS_REGION}"
-          cmd+=" POSTGRES_PARAMETER=${POSTGRES_PARAMETER} LOG_GROUP=${LOG_GROUP} bash /opt/mlflow/deploy.sh"
+          cmd+=" POSTGRES_PARAMETER=${POSTGRES_PARAMETER} LOG_GROUP=${LOG_GROUP}"
+          cmd+=" SERVER_LOG_GROUP=${SERVER_LOG_GROUP} bash /opt/mlflow/deploy.sh"
           id=$(aws ssm send-command --instance-ids "${INSTANCE_ID}" \
             --document-name AWS-RunShellScript --comment "deploy ${GITHUB_SHA::7}" \
             --parameters "$(jq -cn --arg c "$cmd" '{commands: [$c]}')" \
@@ -162,4 +165,7 @@ jobs:
             --query '[StandardOutputContent, StandardErrorContent]' --output text
           [ "$status" = "Success" ] || { echo "::error::Deploy: ${status}"; exit 1; }
 
-          echo "### MLflow: http://${PUBLIC_IP}:8080" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### MLflow: http://${PUBLIC_IP}:8080"
+            echo "Accesos por IP: CloudWatch > Logs Insights > Saved queries > \`mlflow/accesos-por-ip\`"
+          } >> "$GITHUB_STEP_SUMMARY"

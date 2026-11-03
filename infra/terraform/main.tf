@@ -233,3 +233,59 @@ resource "aws_cloudwatch_log_resource_policy" "eventbridge" {
     }]
   })
 }
+
+# ---------------------------------------------------------------------------
+# Accesos a MLflow. Docker envia aqui la salida del contenedor con su driver
+# awslogs (sin agente): una linea por peticion con la IP remota, mas avisos y
+# errores del servidor. Cada linea son ~150 bytes, asi que incluso con
+# escaneos de internet son centavos al mes.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_log_group" "server" {
+  name              = "/${var.project}/server"
+  retention_in_days = 30
+}
+
+# Consultas guardadas en CloudWatch > Logs Insights > Saved queries (gratis;
+# cada ejecucion cobra US$0.005 por GB leido). Solo cuentan IPs publicas: asi
+# quedan fuera el healthcheck de Docker (127.0.0.1) y las peticiones de la
+# propia instancia, que llegan desde la red de Docker (172.16.0.0/12).
+locals {
+  # Linea de acceso de uvicorn (formato de MLflow 3.x):
+  #   2026/11/02 22:41:43 INFO:     203.0.113.7:48740 - "GET /api/2.0/... HTTP/1.1" 200 OK
+  accesos_publicos = trimspace(<<-EOT
+    parse @message /(?<ip>\d+\.\d+\.\d+\.\d+):\d+ - "(?<metodo>\S+) (?<ruta>\S+) [^"]+" (?<estado>\d+)/
+    | filter isPublicIP(ip)
+  EOT
+  )
+}
+
+resource "aws_cloudwatch_query_definition" "accesos_por_ip" {
+  name            = "${var.project}/accesos-por-ip"
+  log_group_names = [aws_cloudwatch_log_group.server.name]
+  query_string    = <<-EOT
+    ${local.accesos_publicos}
+    | stats count(*) as accesos, countDistinct(ruta) as rutas, earliest(@timestamp) as primero, latest(@timestamp) as ultimo by ip
+    | sort accesos desc
+    | limit 1000
+  EOT
+}
+
+resource "aws_cloudwatch_query_definition" "accesos_por_hora" {
+  name            = "${var.project}/accesos-por-hora"
+  log_group_names = [aws_cloudwatch_log_group.server.name]
+  query_string    = <<-EOT
+    ${local.accesos_publicos}
+    | stats count(*) as accesos, countDistinct(ip) as ips by bin(1h)
+  EOT
+}
+
+resource "aws_cloudwatch_query_definition" "accesos_detalle" {
+  name            = "${var.project}/accesos-detalle"
+  log_group_names = [aws_cloudwatch_log_group.server.name]
+  query_string    = <<-EOT
+    ${local.accesos_publicos}
+    | fields @timestamp, ip, metodo, ruta, estado
+    | sort @timestamp desc
+    | limit 1000
+  EOT
+}

@@ -4,6 +4,7 @@
 set -euo pipefail
 
 : "${MLFLOW_IMAGE:?}" "${MLFLOW_PUBLIC_HOST:?}" "${ARTIFACTS_BUCKET:?}" "${AWS_REGION:?}" "${POSTGRES_PARAMETER:?}"
+: "${SERVER_LOG_GROUP:?}" # accesos de MLflow en CloudWatch (driver awslogs del compose)
 LOG_GROUP="${LOG_GROUP:-}"
 COMPOSE_VERSION=v2.40.3
 export HOME="${HOME:-/root}" # SSM no siempre define HOME y docker lo necesita
@@ -33,6 +34,7 @@ rm -f secrets.env # clave aleatoria de versiones anteriores
     echo "MLFLOW_PUBLIC_HOST=${MLFLOW_PUBLIC_HOST}"
     echo "ARTIFACTS_DESTINATION=s3://${ARTIFACTS_BUCKET}/artifacts"
     echo "AWS_DEFAULT_REGION=${AWS_REGION}"
+    echo "SERVER_LOG_GROUP=${SERVER_LOG_GROUP}"
 } >.env
 
 # 3) Imagen nueva de ECR y arranque
