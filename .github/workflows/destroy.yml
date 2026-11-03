@@ -2,8 +2,8 @@ name: destroy
 
 # Etapas: config -> terraform (destroy) -> limpieza
 # Borra TODO: servidor, base de datos (runs y metricas), modelos en S3,
-# imagenes en ECR, logs, el parametro de la clave de Postgres y el bucket del
-# estado. La cuenta queda vacia.
+# imagenes en ECR, logs, los parametros de Parameter Store que creo Terraform
+# y el bucket del estado. La cuenta queda vacia.
 on:
   workflow_dispatch:
     inputs:
@@ -86,21 +86,34 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/aws-setup
 
-      - name: Borrar parametro de Postgres
+      # Va antes de borrar los buckets: si falla, el estado de Terraform se
+      # conserva y se puede repetir el destroy.
+      - name: Borrar parametros de Terraform
         run: |
-          # Si habia estado, terraform destroy ya lo borro. Esto cubre el
-          # parametro huerfano (sin estado, por ejemplo tras reiniciar el lab),
-          # que haria fallar el siguiente deploy con ParameterAlreadyExists.
-          # Su valor viene del secret POSTGRES_PASSWORD: deploy lo vuelve a crear.
-          param=/mlflow/postgres-password
-          if err=$(aws ssm delete-parameter --name "$param" 2>&1); then
-            echo "Parametro borrado: $param"
-          else
-            case "$err" in
-              *ParameterNotFound*) echo "El parametro $param no existe." ;;
-              *) echo "::error::No se pudo borrar el parametro $param: ${err}"; exit 1 ;;
-            esac
+          # Todos los parametros de Parameter Store que creo Terraform: llevan
+          # las default_tags del provider (Project=mlflow, ManagedBy=terraform),
+          # asi que se encuentran aunque ya no esten en el estado (por ejemplo
+          # tras reiniciar el lab), en cuyo caso harian fallar el siguiente
+          # deploy con ParameterAlreadyExists. Si habia estado, terraform
+          # destroy ya los borro y aqui no queda ninguno. Sus valores vienen de
+          # secrets de GitHub: deploy los vuelve a crear.
+          filters='[{"Key":"tag:Project","Values":["mlflow"]},{"Key":"tag:ManagedBy","Values":["terraform"]}]'
+          names=$(aws ssm describe-parameters --parameter-filters "$filters" \
+            --query 'Parameters[].Name' --output text)
+          if [ -z "$names" ] || [ "$names" = None ]; then
+            echo "No quedan parametros de Terraform."
+            exit 0
           fi
+          for name in $names; do
+            if err=$(aws ssm delete-parameter --name "$name" 2>&1); then
+              echo "Parametro borrado: $name"
+            else
+              case "$err" in
+                *ParameterNotFound*) echo "Ya no existia: $name" ;;
+                *) echo "::error::No se pudo borrar el parametro $name: ${err}"; exit 1 ;;
+              esac
+            fi
+          done
 
       - name: Borrar buckets
         run: |
