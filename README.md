@@ -27,7 +27,9 @@ Las credenciales cambian cada vez que inicias el lab y caducan cuando termina la
 ## 3. Desplegar y destruir
 
 - **Actions → deploy → Run workflow**: etapas `config` (credenciales y buckets) → `terraform` → `build` (imagen en ECR) → `deploy` (EC2 por SSM). La URL aparece en el resumen del run. Si la sesión anterior detuvo la EC2, el deploy la vuelve a encender.
-- **Actions → destroy → Run workflow**, escribiendo `destroy`: etapas `config` → `terraform` → `buckets`. Borra todo, incluidos runs, métricas, modelos, imágenes, logs y el bucket del estado. La cuenta queda vacía.
+- **Actions → destroy → Run workflow**, escribiendo `destroy`: etapas `config` → `terraform` → `limpieza`. Borra todo, incluidos runs, métricas, modelos, imágenes, logs, el parámetro `/mlflow/postgres-password` y el bucket del estado. La cuenta queda vacía.
+
+Si reinicias el lab sin hacer destroy, el reinicio puede borrar el estado de Terraform y dejar el parámetro `/mlflow/postgres-password`. Entonces deploy falla con `ParameterAlreadyExists`. Lanza destroy una vez: aunque no haya estado, borra el parámetro, y el siguiente deploy lo vuelve a crear con el secret `POSTGRES_PASSWORD`.
 
 Las dos etapas `config` fallan si las credenciales no sirven (caducadas, revocadas al reiniciar el lab o mal copiadas), en vez de seguir como si no hubiera nada desplegado.
 
