@@ -25,6 +25,11 @@ output "log_group" {
   value       = aws_cloudwatch_log_group.ec2.name
 }
 
+output "gdrive_parameter" {
+  description = "Parametro SSM con la configuracion de rclone para Google Drive (vacio: respaldos desactivados)"
+  value       = try(aws_ssm_parameter.gdrive[0].name, "")
+}
+
 output "server_log_group" {
   description = "Log group de CloudWatch con la salida de MLflow: accesos con IP remota y errores"
   value       = aws_cloudwatch_log_group.server.name

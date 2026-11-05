@@ -1,9 +1,10 @@
 name: destroy
 
-# Etapas: config -> terraform (destroy) -> limpieza
-# Borra TODO: servidor, base de datos (runs y metricas), modelos en S3,
+# Etapas: config -> respaldo (Google Drive) -> terraform (destroy) -> limpieza
+# Borra TODO en AWS: servidor, base de datos (runs y metricas), modelos en S3,
 # imagenes en ECR, logs, los parametros de Parameter Store que creo Terraform
-# y el bucket del estado. La cuenta queda vacia.
+# y el bucket del estado. La cuenta queda vacia. Lo que este en Google Drive
+# no se toca: el proximo deploy lo restaura.
 on:
   workflow_dispatch:
     inputs:
@@ -11,6 +12,10 @@ on:
         description: 'Escribe "destroy" para borrar todo, incluidos runs y modelos'
         required: true
         type: string
+      respaldo:
+        description: "Respaldar antes en Google Drive (si falla, no se borra nada)"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -55,9 +60,56 @@ jobs:
             echo "No existe el bucket del estado: no hay stack que destruir."
           fi
 
-  terraform:
+  # Ultimo respaldo con MLflow detenido (consistente). Si falla, terraform y
+  # limpieza no corren: no se borra nada.
+  respaldo:
     needs: config
-    if: needs.config.outputs.has_state == 'true'
+    if: needs.config.outputs.has_state == 'true' && inputs.respaldo
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
+
+      - name: Stack
+        id: stack
+        uses: ./.github/actions/stack
+        with:
+          start: "true"
+
+      - name: Google Drive configurado
+        id: check
+        env:
+          INSTANCE_ID: ${{ steps.stack.outputs.instance_id }}
+          GDRIVE: ${{ steps.stack.outputs.gdrive_parameter }}
+        run: |
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "::warning::No hay instancia en el estado: no hay nada que respaldar."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [ -z "$GDRIVE" ]; then
+            echo "::warning::Google Drive no esta configurado (secret GDRIVE_RCLONE_CONF): se destruye SIN respaldo."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Respaldo en Google Drive (SSM)
+        if: steps.check.outputs.run == 'true'
+        uses: ./.github/actions/ssm-run
+        with:
+          instance-id: ${{ steps.stack.outputs.instance_id }}
+          command: bash /opt/mlflow/scripts/backup_mlflow.sh --stop-server
+          comment: respaldo antes de destroy
+          timeout-minutes: 60
+
+      - name: Si fallo
+        if: failure()
+        run: |
+          echo "::error::No se pudo respaldar en Google Drive y no se borro nada. Revisa el error, o lanza destroy con 'Respaldar antes' desmarcado para borrar sin respaldo."
+
+  terraform:
+    needs: [config, respaldo]
+    if: needs.config.outputs.has_state == 'true' && !failure() && !cancelled()
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

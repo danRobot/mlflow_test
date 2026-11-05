@@ -45,3 +45,10 @@ variable "postgres_password" {
     error_message = "POSTGRES_PASSWORD: al menos 8 caracteres, solo letras, numeros y . _ ~ -"
   }
 }
+
+variable "gdrive_rclone_conf" {
+  description = "Configuracion de rclone para Google Drive (secret GDRIVE_RCLONE_CONF, salida de 'rclone config show'). Vacia = sin respaldos en Drive."
+  type        = string
+  default     = ""
+  sensitive   = true
+}

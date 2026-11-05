@@ -1,8 +1,14 @@
 name: deploy
 
 # Etapas: config -> terraform -> build (imagen en ECR) -> deploy (EC2 por SSM)
+#         -> restaurar (ultimo respaldo de Google Drive si la base esta vacia)
 on:
   workflow_dispatch:
+    inputs:
+      restaurar:
+        description: "Si la base de MLflow esta vacia (stack nuevo o lab reiniciado), restaurar el ultimo respaldo de Google Drive"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -23,6 +29,8 @@ env:
   TF_IN_AUTOMATION: "true"
   TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
   TF_VAR_postgres_password: ${{ secrets.POSTGRES_PASSWORD }}
+  # Opcional: sin el, no hay respaldos en Google Drive (ver README).
+  TF_VAR_gdrive_rclone_conf: ${{ secrets.GDRIVE_RCLONE_CONF }}
 
 jobs:
   config:
@@ -34,6 +42,24 @@ jobs:
           if [ -z "$TF_VAR_postgres_password" ]; then
             echo "::error::Falta el secret POSTGRES_PASSWORD (Settings > Secrets and variables > Actions)."
             exit 1
+          fi
+
+      - name: Secret GDRIVE_RCLONE_CONF
+        run: |
+          if [ -z "$TF_VAR_gdrive_rclone_conf" ]; then
+            echo "::warning::Sin el secret GDRIVE_RCLONE_CONF no hay respaldos en Google Drive (ver README)."
+            exit 0
+          fi
+          # Es la salida de 'rclone config show': [nombre], type = drive y el token.
+          conf=$TF_VAR_gdrive_rclone_conf
+          if ! grep -qE '^\[.+\][[:space:]]*$' <<<"$conf" ||
+            ! grep -qE '^type[[:space:]]*=[[:space:]]*drive[[:space:]]*$' <<<"$conf" ||
+            ! grep -qE '^token[[:space:]]*=' <<<"$conf"; then
+            echo "::error::GDRIVE_RCLONE_CONF no es una configuracion de rclone para Google Drive: pega la salida completa de 'rclone config show' (ver README)."
+            exit 1
+          fi
+          if ! grep -qE '^client_id[[:space:]]*=[[:space:]]*[^[:space:]]' <<<"$conf"; then
+            echo "::warning::GDRIVE_RCLONE_CONF usa el client_id compartido de rclone, que Google retira en 2026. Crea el tuyo (ver README)."
           fi
 
       - uses: actions/checkout@v7
@@ -65,6 +91,7 @@ jobs:
       postgres_parameter: ${{ steps.apply.outputs.postgres_parameter }}
       log_group: ${{ steps.apply.outputs.log_group }}
       server_log_group: ${{ steps.apply.outputs.server_log_group }}
+      gdrive_parameter: ${{ steps.apply.outputs.gdrive_parameter }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/aws-setup
@@ -82,7 +109,7 @@ jobs:
             -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="region=${AWS_REGION}"
           terraform apply -input=false -auto-approve
-          for name in instance_id public_ip postgres_parameter log_group server_log_group; do
+          for name in instance_id public_ip postgres_parameter log_group server_log_group gdrive_parameter; do
             echo "${name}=$(terraform output -raw "$name")" >> "$GITHUB_OUTPUT"
           done
 
@@ -121,51 +148,79 @@ jobs:
       POSTGRES_PARAMETER: ${{ needs.terraform.outputs.postgres_parameter }}
       LOG_GROUP: ${{ needs.terraform.outputs.log_group }}
       SERVER_LOG_GROUP: ${{ needs.terraform.outputs.server_log_group }}
+      GDRIVE_PARAMETER: ${{ needs.terraform.outputs.gdrive_parameter }}
       IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/aws-setup
 
-      - name: Deploy en la EC2 (SSM)
+      - name: Archivos a S3 y comando de deploy
+        id: files
         run: |
           # Los archivos viajan por S3; la instancia los descarga y ejecuta deploy.sh.
           for f in docker-compose.yml infra/deploy.sh infra/oom-alert.sh; do
             aws s3 cp "$f" "s3://${ARTIFACTS_BUCKET}/deploy/$(basename "$f")"
           done
-
-          echo "Esperando a que la instancia se registre en SSM..."
-          status=""
-          for _ in $(seq 60); do
-            status=$(aws ssm describe-instance-information \
-              --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
-              --query 'InstanceInformationList[0].PingStatus' --output text)
-            [ "$status" = "Online" ] && break
-            sleep 10
-          done
-          [ "$status" = "Online" ] || { echo "::error::La instancia no aparece en SSM"; exit 1; }
+          aws s3 cp infra/scripts/ "s3://${ARTIFACTS_BUCKET}/deploy/scripts/" --recursive
 
           cmd="mkdir -p /opt/mlflow"
           cmd+=" && aws s3 cp s3://${ARTIFACTS_BUCKET}/deploy/ /opt/mlflow/ --recursive --quiet"
           cmd+=" && MLFLOW_IMAGE=${ECR_REPOSITORY}:${IMAGE_TAG} MLFLOW_PUBLIC_HOST=${PUBLIC_IP}"
           cmd+=" ARTIFACTS_BUCKET=${ARTIFACTS_BUCKET} AWS_REGION=${AWS_REGION}"
           cmd+=" POSTGRES_PARAMETER=${POSTGRES_PARAMETER} LOG_GROUP=${LOG_GROUP}"
-          cmd+=" SERVER_LOG_GROUP=${SERVER_LOG_GROUP} bash /opt/mlflow/deploy.sh"
-          id=$(aws ssm send-command --instance-ids "${INSTANCE_ID}" \
-            --document-name AWS-RunShellScript --comment "deploy ${GITHUB_SHA::7}" \
-            --parameters "$(jq -cn --arg c "$cmd" '{commands: [$c]}')" \
-            --query Command.CommandId --output text)
+          cmd+=" SERVER_LOG_GROUP=${SERVER_LOG_GROUP} GDRIVE_PARAMETER=${GDRIVE_PARAMETER}"
+          cmd+=" bash /opt/mlflow/deploy.sh"
+          echo "command=${cmd}" >> "$GITHUB_OUTPUT"
 
-          for _ in $(seq 90); do
-            sleep 10
-            status=$(aws ssm get-command-invocation --command-id "$id" --instance-id "${INSTANCE_ID}" \
-              --query Status --output text 2>/dev/null || echo Pending)
-            case "$status" in Pending | InProgress | Delayed) ;; *) break ;; esac
-          done
-          aws ssm get-command-invocation --command-id "$id" --instance-id "${INSTANCE_ID}" \
-            --query '[StandardOutputContent, StandardErrorContent]' --output text
-          [ "$status" = "Success" ] || { echo "::error::Deploy: ${status}"; exit 1; }
+      - name: Deploy en la EC2 (SSM)
+        uses: ./.github/actions/ssm-run
+        with:
+          instance-id: ${{ env.INSTANCE_ID }}
+          command: ${{ steps.files.outputs.command }}
+          comment: deploy ${{ github.sha }}
+          timeout-minutes: 15
 
+      - name: Resumen
+        run: |
           {
             echo "### MLflow: http://${PUBLIC_IP}:8080"
             echo "Accesos por IP: CloudWatch > Logs Insights > Saved queries > \`mlflow/accesos-por-ip\`"
+            echo ""
+            if [ -n "$GDRIVE_PARAMETER" ]; then
+              echo "Respaldos en Google Drive: activados (cada hora y al apagar la EC2)."
+            else
+              echo "Respaldos en Google Drive: **desactivados** (falta el secret \`GDRIVE_RCLONE_CONF\`, ver README)."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Tras un reinicio del lab o un destroy, el stack nace vacio: se trae el
+  # ultimo respaldo de Drive. Si la base ya tiene datos, no hace nada.
+  restaurar:
+    needs: [terraform, deploy]
+    if: inputs.restaurar && needs.terraform.outputs.gdrive_parameter != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 125
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
+
+      - name: Restaurar si la base esta vacia (SSM)
+        id: restore
+        uses: ./.github/actions/ssm-run
+        with:
+          instance-id: ${{ needs.terraform.outputs.instance_id }}
+          command: bash /opt/mlflow/scripts/restore_mlflow.sh --if-empty --yes
+          comment: restaurar si la base esta vacia
+          timeout-minutes: 120
+
+      - name: Resumen
+        env:
+          OUTPUT: ${{ steps.restore.outputs.output }}
+        run: |
+          restored=$(sed -n 's/^RESTAURADO=//p' <<<"$OUTPUT")
+          if [ -n "$restored" ]; then
+            msg="Restaurado de Google Drive: \`${restored}\`."
+          else
+            msg=$(grep -E 'ya tiene datos|No hay respaldos' <<<"$OUTPUT" || echo "Sin restauracion.")
+          fi
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
