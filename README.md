@@ -96,7 +96,9 @@ Para entrar a la instancia: `aws ssm start-session --target <instance_id>` (requ
 uv run scripts/backup_local.py --tracking-uri http://<IP>:8080
 ```
 
-`uv` instala solo la dependencia (`mlflow-skinny==3.17.0`, la misma versión que el servidor). Sin uv: `pip install mlflow-skinny==3.17.0` y `python scripts/backup_local.py --tracking-uri http://<IP>:8080`.
+`uv` instala solo las dependencias: `mlflow-skinny==3.17.0` (la misma versión que el servidor) y `tqdm` para las barras de progreso. Sin uv: `pip install mlflow-skinny==3.17.0 tqdm==4.70.1` y `python scripts/backup_local.py --tracking-uri http://<IP>:8080`.
+
+Mientras corre muestra dos barras: una de metadatos (corridas y modelos) y otra de artefactos con los MB descargados, la velocidad y el tiempo restante.
 
 Cada respaldo queda en `~/mlflow-backups/mlflow-backup-AAAAMMDD-HHMMSS/` (hora UTC), con un `manifest.json` de conteos y un JSON por experimento, corrida y modelo junto a sus artefactos. Se conservan los 5 más recientes (`--keep`). `--dest` cambia la carpeta y `--no-artifacts` guarda solo los metadatos. `--help` muestra todas las opciones.
 
@@ -112,7 +114,7 @@ Tras un reinicio del lab o un destroy: lanza deploy (MLflow arranca vacío) y, c
 uv run scripts/restore_local.py --tracking-uri http://<IP>:8080
 ```
 
-Carga el respaldo más reciente de `~/mlflow-backups`; para otro, pasa su carpeta como argumento. Recrea experimentos, corridas (con sus fechas, estado, parámetros, tags, datasets y el historial de métricas), artefactos, logged models y modelos registrados con versiones y alias, y al final compara los conteos con el manifiesto del respaldo.
+Carga el respaldo más reciente de `~/mlflow-backups`; para otro, pasa su carpeta como argumento. Recrea experimentos, corridas (con sus fechas, estado, parámetros, tags, datasets y el historial de métricas), artefactos, logged models y modelos registrados con versiones y alias, y al final compara los conteos con el manifiesto del respaldo. Muestra las mismas dos barras que el respaldo, con los MB subidos.
 
 - Si el servidor ya tiene datos no hace nada, para no duplicarlos: tiene que ser un MLflow recién desplegado.
 - Experimentos, corridas y logged models reciben IDs nuevos (MLflow no deja elegirlos). Lo que use nombres sigue igual, incluidos los alias como `models:/mi-modelo@champion`. La correspondencia entre IDs viejos y nuevos queda en `id-map-*.json`, dentro de la carpeta del respaldo.

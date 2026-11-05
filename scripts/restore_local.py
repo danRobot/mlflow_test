@@ -4,6 +4,7 @@
 # dependencies = [
 #     # La misma version que el servidor (infra/mlflow-server/Dockerfile).
 #     "mlflow-skinny==3.17.0",
+#     "tqdm==4.70.1",
 # ]
 # ///
 """Carga en un MLflow limpio un respaldo de scripts/backup_local.py.
@@ -29,8 +30,11 @@ Uso, con el servidor recien desplegado (vacio):
   uv run scripts/restore_local.py --tracking-uri http://IP:8080 ~/mlflow-backups/mlflow-backup-AAAAMMDD-HHMMSS
 
   o, sin uv:
-  pip install mlflow-skinny==3.17.0
+  pip install mlflow-skinny==3.17.0 tqdm==4.70.1
   python scripts/restore_local.py --tracking-uri http://IP:8080
+
+Muestra dos barras de progreso: metadatos (corridas y modelos creados) y
+artefactos (bytes subidos, velocidad y tiempo restante).
 
 Sin ruta, usa el respaldo mas reciente de ~/mlflow-backups (--dest cambia la
 carpeta). Si el servidor ya tiene datos (corridas, experimentos aparte de
@@ -44,8 +48,10 @@ import datetime as dt
 import json
 import logging
 import os
+import posixpath
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -53,6 +59,8 @@ from pathlib import Path
 os.environ.setdefault("MLFLOW_DISABLE_TELEMETRY", "true")
 # Sin el "View run at ..." que MLflow escribe por cada corrida terminada.
 os.environ.setdefault("MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT", "true")
+# Las barras de MLflow (una por archivo) las reemplaza la barra general.
+os.environ.setdefault("MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR", "false")
 
 import mlflow  # noqa: E402
 import requests  # noqa: E402
@@ -66,6 +74,13 @@ from mlflow.entities import (  # noqa: E402
     Param,
     ViewType,
 )
+from mlflow.environment_variables import MLFLOW_MULTIPART_UPLOAD_MINIMUM_FILE_SIZE  # noqa: E402
+from mlflow.store.artifact.artifact_repository_registry import get_artifact_repository  # noqa: E402
+from mlflow.store.artifact.http_artifact_repo import HttpArtifactRepository  # noqa: E402
+from mlflow.utils.credentials import get_default_host_creds  # noqa: E402
+from mlflow.utils.mime_type_utils import _guess_mime_type  # noqa: E402
+from mlflow.utils.rest_utils import augmented_raise_for_status, http_request  # noqa: E402
+from tqdm import tqdm  # noqa: E402
 
 NAME_RE = re.compile(r"^mlflow-backup-\d{8}-\d{6}$")
 TERMINATED = {"FINISHED", "FAILED", "KILLED"}
@@ -80,6 +95,14 @@ def log(msg: str) -> None:
 def die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def abort(msg: str) -> None:
+    """Como die, pero sin esperar a las subidas que MLflow siga haciendo en
+    otros hilos: al salir normal, Python esperaria a que terminen."""
+    sys.stdout.flush()
+    print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+    os._exit(1)
 
 
 def load(path: Path) -> dict:
@@ -133,6 +156,109 @@ def check_empty(client: MlflowClient) -> None:
         )
 
 
+def short(text: str, width: int = 28) -> str:
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+class Progress:
+    """Barra de bytes que pueden avanzar varios hilos a la vez."""
+
+    def __init__(self, bar: tqdm):
+        self.bar = bar
+        self.done = 0
+        self._lock = threading.Lock()
+
+    def add(self, n: int) -> None:
+        with self._lock:
+            self.done += n
+            self.bar.update(n)
+
+
+class ProgressFile:
+    """El archivo que sube requests: suma a la barra lo que va leyendo."""
+
+    def __init__(self, f, progress: Progress):
+        self._f, self._progress = f, progress
+        self._pos = f.tell()
+
+    def _advance(self) -> None:
+        pos = self._f.tell()
+        self._progress.add(pos - self._pos)  # negativo si requests rebobina para reintentar
+        self._pos = pos
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._f.read(size)
+        self._advance()
+        return data
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        result = self._f.seek(offset, whence)
+        self._advance()
+        return result
+
+    def tell(self) -> int:
+        return self._f.tell()
+
+    # requests calcula el Content-Length con fstat y comprueba el modo binario.
+    def fileno(self) -> int:
+        return self._f.fileno()
+
+    @property
+    def mode(self) -> str:
+        return self._f.mode
+
+
+def count_parts(repo, progress: Progress) -> None:
+    """Suma a la barra cada parte que MLflow sube directo al bucket.
+
+    MLflow sube los archivos de 500 MB o mas (MLFLOW_MULTIPART_UPLOAD_MINIMUM_FILE_SIZE)
+    por partes paralelas con URLs prefirmadas, sin informar del avance: se
+    envuelve el metodo que sube cada parte, solo en este repositorio.
+    """
+    original = getattr(repo, "_upload_part", None)
+    if original is None:  # otra version de MLflow: la barra avanza por archivo
+        return
+
+    def upload_part(*args, **kwargs):
+        part = original(*args, **kwargs)
+        local_file, start, size = (kwargs.get(k) for k in ("local_file", "start_byte", "size"))
+        if None not in (local_file, start, size):
+            progress.add(max(0, min(size, os.path.getsize(local_file) - start)))
+        return part
+
+    repo._upload_part = upload_part
+
+
+def upload_dir(local_dir: Path, artifact_uri: str, tracking_uri: str, progress: Progress) -> int:
+    """Sube los archivos de `local_dir` a `artifact_uri`. Devuelve cuantos son."""
+    repo = get_artifact_repository(artifact_uri, tracking_uri=tracking_uri)
+    count_parts(repo, progress)
+    multipart_from = MLFLOW_MULTIPART_UPLOAD_MINIMUM_FILE_SIZE.get()
+    files = sorted(p for p in local_dir.rglob("*") if p.is_file())
+    for path in files:
+        rel = path.relative_to(local_dir).as_posix()
+        size = path.stat().st_size
+        before = progress.done
+        if isinstance(repo, HttpArtifactRepository) and size < multipart_from:
+            # Lo que hace HttpArtifactRepository.log_artifact con los archivos
+            # chicos (un PUT al servidor), pero contando los bytes que salen.
+            with open(path, "rb") as f:
+                resp = http_request(
+                    get_default_host_creds(repo.artifact_uri),
+                    "/" + rel,
+                    "PUT",
+                    data=ProgressFile(f, progress),
+                    extra_headers={"Content-Type": _guess_mime_type(path.name)},
+                )
+                augmented_raise_for_status(resp)
+        else:
+            # Los grandes, como siempre: por partes directo al bucket si el
+            # servidor lo permite, sin pasar por su memoria.
+            repo.log_artifact(str(path), posixpath.dirname(rel) or None)
+        progress.add(size - (progress.done - before))  # lo que no se conto por el camino
+    return len(files)
+
+
 class Restorer:
     def __init__(self, client: MlflowClient, backup: Path):
         self.client = client
@@ -149,13 +275,18 @@ class Restorer:
             "model_versions": 0,
             "artifact_files": 0,
         }
+        self.uploads: list[tuple[Path, str, str]] = []  # carpeta local, URI destino, etiqueta
+        self.to_finalize: list[tuple[str, str]] = []  # logged model, estado final
 
-    def upload(self, local: Path, log_fn, target_id: str) -> None:
-        if local.is_dir():
-            files = sum(1 for p in local.rglob("*") if p.is_file())
-            if files:
-                log_fn(target_id, str(local))
-                self.counts["artifact_files"] += files
+    def upload_all(self) -> None:
+        if not self.uploads:
+            return
+        total = sum(p.stat().st_size for d, _, _ in self.uploads for p in d.rglob("*") if p.is_file())
+        with tqdm(total=total, desc="Subiendo", unit="B", unit_scale=True, unit_divisor=1024) as bar:
+            progress = Progress(bar)
+            for local, uri, label in self.uploads:
+                bar.set_postfix_str(label, refresh=False)
+                self.counts["artifact_files"] += upload_dir(local, uri, self.client.tracking_uri, progress)
 
     def experiment(self, exp_dir: Path) -> str:
         exp = load(exp_dir / "experiment.json")
@@ -170,8 +301,7 @@ class Restorer:
         self.counts["experiments"] += 1
         return new_id
 
-    def run(self, run_dir: Path, exp_id: str) -> tuple[str, dict]:
-        data = load(run_dir / "run.json")
+    def run(self, run_dir: Path, exp_id: str, data: dict, label: str) -> str:
         info, rdata = data["info"], data["data"]
         tags = dict(rdata.get("tags") or {})
         # MLflow toma el usuario del tag mlflow.user ("unknown" si falta). Si la
@@ -219,12 +349,12 @@ class Restorer:
         if datasets:
             self.client.log_inputs(new_id, datasets=datasets)
 
-        self.upload(run_dir / "artifacts", self.client.log_artifacts, new_id)
+        if (run_dir / "artifacts").is_dir():
+            self.uploads.append((run_dir / "artifacts", run.info.artifact_uri, label))
         self.counts["runs"] += 1
-        return new_id, data
+        return new_id
 
-    def logged_model(self, model_dir: Path, exp_id: str) -> None:
-        m = load(model_dir / "model.json")
+    def logged_model(self, model_dir: Path, exp_id: str, m: dict, label: str) -> None:
         tags = {k: v for k, v in (m.get("tags") or {}).items() if k not in SKIP_MODEL_TAGS}
         params = {k: str(v) for k, v in (m.get("params") or {}).items()}
         new = self.client.create_logged_model(
@@ -236,9 +366,11 @@ class Restorer:
             model_type=m.get("model_type") or None,
         )
         self.model_map[m["model_id"]] = new.model_id
-        self.upload(model_dir / "artifacts", self.client.log_model_artifacts, new.model_id)
+        if (model_dir / "artifacts").is_dir():
+            self.uploads.append((model_dir / "artifacts", new.artifact_location, label))
+        # Se marca como listo cuando ya tenga sus artefactos (despues de subirlos).
         status = m.get("status") if m.get("status") in ("READY", "FAILED") else "READY"
-        self.client.finalize_logged_model(new.model_id, status)
+        self.to_finalize.append((new.model_id, status))
         self.counts["logged_models"] += 1
 
     def finish_run(self, old_id: str, data: dict) -> None:
@@ -296,25 +428,41 @@ class Restorer:
             self.client.set_registered_model_alias(name, alias, str(version))
         self.counts["registered_models"] += 1
 
-    def restore(self) -> None:
+    def restore(self) -> list[str]:
         exp_dirs = sorted((self.backup / "experiments").glob("*"), key=lambda p: int(p.name))
+        total = sum(len(list((d / "runs").glob("*"))) + len(list((d / "models").glob("*"))) for d in exp_dirs)
         pending: list[tuple[str, dict]] = []
-        for exp_dir in exp_dirs:
-            exp_id = self.experiment(exp_dir)
-            runs = models = 0
-            for run_dir in sorted((exp_dir / "runs").glob("*")):
-                _, data = self.run(run_dir, exp_id)
-                pending.append((data["info"]["run_id"], data))
-                runs += 1
-            for model_dir in sorted((exp_dir / "models").glob("*")):
-                self.logged_model(model_dir, exp_id)
-                models += 1
-            name = load(exp_dir / "experiment.json")["name"]
-            print(f"    {name}: {runs} corridas, {models} logged models", flush=True)
+        lines = []
+        with tqdm(total=total, desc="Metadatos", unit=" elem") as bar:
+            for exp_dir in exp_dirs:
+                exp_id = self.experiment(exp_dir)
+                name = load(exp_dir / "experiment.json")["name"]
+                runs = models = 0
+                for run_dir in sorted((exp_dir / "runs").glob("*")):
+                    data = load(run_dir / "run.json")
+                    label = short(f"{name}/{data['info'].get('run_name') or run_dir.name[:8]}")
+                    bar.set_postfix_str(label, refresh=False)
+                    self.run(run_dir, exp_id, data, label)
+                    pending.append((data["info"]["run_id"], data))
+                    runs += 1
+                    bar.update()
+                for model_dir in sorted((exp_dir / "models").glob("*")):
+                    m = load(model_dir / "model.json")
+                    label = short(f"{name}/{m.get('name') or model_dir.name}")
+                    bar.set_postfix_str(label, refresh=False)
+                    self.logged_model(model_dir, exp_id, m, label)
+                    models += 1
+                    bar.update()
+                lines.append(f"    {name}: {runs} corridas, {models} logged models")
+            bar.set_postfix_str("", refresh=True)
+        self.upload_all()
+        for model_id, status in self.to_finalize:
+            self.client.finalize_logged_model(model_id, status)
         for old_id, data in pending:
             self.finish_run(old_id, data)
         for path in sorted((self.backup / "registered_models").glob("*.json")):
             self.registered_model(path)
+        return lines
 
 
 def main() -> None:
@@ -363,30 +511,32 @@ def main() -> None:
     restorer = Restorer(client, backup)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
     map_path = backup / f"id-map-{stamp}.json"
+    failure = None
     try:
-        restorer.restore()
-    except BaseException as e:
-        detail = "interrumpido" if isinstance(e, KeyboardInterrupt) else str(e)
-        die(
-            f"la carga fallo ({detail}). El servidor quedo a medias: vuelve a desplegarlo limpio "
-            "(destroy y deploy) antes de reintentar."
+        lines = restorer.restore()
+    except BaseException as e:  # tambien Ctrl+C
+        failure = "interrumpido" if isinstance(e, KeyboardInterrupt) else str(e)
+    map_path.write_text(
+        json.dumps(
+            {
+                "tracking_uri": tracking_uri,
+                "experiments": restorer.exp_map,
+                "runs": restorer.run_map,
+                "logged_models": restorer.model_map,
+            },
+            indent=2,
         )
-    finally:
-        map_path.write_text(
-            json.dumps(
-                {
-                    "tracking_uri": tracking_uri,
-                    "experiments": restorer.exp_map,
-                    "runs": restorer.run_map,
-                    "logged_models": restorer.model_map,
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
+        + "\n",
+        encoding="utf-8",
+    )
+    if failure is not None:
+        abort(
+            f"la carga fallo ({failure}). El servidor quedo a medias: vuelve a desplegarlo limpio "
+            "(destroy y deploy) antes de reintentar."
         )
 
     print()
+    print("\n".join(lines))
     print(f"Carga terminada en {time.time() - start:.0f} s. Verificacion contra el manifiesto:")
     mismatch = False
     labels = {
