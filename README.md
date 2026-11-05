@@ -71,3 +71,20 @@ MLflow no pide usuario ni clave. La única clave es la de Postgres, que no se ex
 Gasto aproximado del crédito del lab: unos US$0.03 por hora con la EC2 encendida si es t3.small (IP y disco incluidos; una m7i-flex.large ronda los US$0.10 por hora) y menos de US$0.01 por hora con ella detenida (la IP y el disco se siguen cobrando). Haz destroy cuando ya no lo necesites.
 
 Para entrar a la instancia: `aws ssm start-session --target <instance_id>` (requiere el plugin de Session Manager), o desde la consola de EC2 con **Connect → Session Manager**.
+
+## Respaldo local
+
+`scripts/backup_local.py` descarga a tu computador todo lo de MLflow, solo con la API de MLflow: experimentos, corridas (parámetros, tags, datasets de entrada y el historial completo de cada métrica), artefactos, logged models y modelos registrados con sus versiones y alias. Con la EC2 encendida, desde la raíz del repo:
+
+```bash
+uv run scripts/backup_local.py --tracking-uri http://<IP>:8080
+```
+
+`uv` instala solo la dependencia (`mlflow-skinny==3.17.0`, la misma versión que el servidor). Sin uv: `pip install mlflow-skinny==3.17.0` y `python scripts/backup_local.py --tracking-uri http://<IP>:8080`.
+
+Cada respaldo queda en `~/mlflow-backups/mlflow-backup-AAAAMMDD-HHMMSS/` (hora UTC), con un `manifest.json` de conteos y un JSON por experimento, corrida y modelo junto a sus artefactos. Se conservan los 5 más recientes (`--keep`). `--dest` cambia la carpeta y `--no-artifacts` guarda solo los metadatos. `--help` muestra todas las opciones.
+
+- Los artefactos que no cambiaron desde el respaldo anterior no se vuelven a descargar: se enlazan desde él, así que tampoco ocupan disco dos veces. AWS cobra la descarga (US$0.09 por GB), y solo se paga la primera vez.
+- Si el respaldo falla o lo cortas con Ctrl+C, no queda ninguna carpeta a medias.
+- No incluye lo que está en la papelera de MLflow, las trazas de GenAI ni los prompts.
+- Es una copia para conservar y consultar: volver a cargarla en un MLflow nuevo requiere un script de importación, que todavía no está en el repo.
