@@ -87,4 +87,17 @@ Cada respaldo queda en `~/mlflow-backups/mlflow-backup-AAAAMMDD-HHMMSS/` (hora U
 - Los artefactos que no cambiaron desde el respaldo anterior no se vuelven a descargar: se enlazan desde él, así que tampoco ocupan disco dos veces. AWS cobra la descarga (US$0.09 por GB), y solo se paga la primera vez.
 - Si el respaldo falla o lo cortas con Ctrl+C, no queda ninguna carpeta a medias.
 - No incluye lo que está en la papelera de MLflow, las trazas de GenAI ni los prompts.
-- Es una copia para conservar y consultar: volver a cargarla en un MLflow nuevo requiere un script de importación, que todavía no está en el repo.
+
+### Cargar un respaldo en un MLflow limpio
+
+Tras un reinicio del lab o un destroy: lanza deploy (MLflow arranca vacío) y, con la IP nueva:
+
+```bash
+uv run scripts/restore_local.py --tracking-uri http://<IP>:8080
+```
+
+Carga el respaldo más reciente de `~/mlflow-backups`; para otro, pasa su carpeta como argumento. Recrea experimentos, corridas (con sus fechas, estado, parámetros, tags, datasets y el historial de métricas), artefactos, logged models y modelos registrados con versiones y alias, y al final compara los conteos con el manifiesto del respaldo.
+
+- Si el servidor ya tiene datos no hace nada, para no duplicarlos: tiene que ser un MLflow recién desplegado.
+- Experimentos, corridas y logged models reciben IDs nuevos (MLflow no deja elegirlos). Lo que use nombres sigue igual, incluidos los alias como `models:/mi-modelo@champion`. La correspondencia entre IDs viejos y nuevos queda en `id-map-*.json`, dentro de la carpeta del respaldo.
+- Si la carga falla a mitad, el servidor queda con datos parciales: vuelve a desplegarlo limpio (destroy y deploy) antes de reintentar.
