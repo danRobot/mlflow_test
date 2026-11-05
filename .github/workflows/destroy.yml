@@ -13,6 +13,7 @@ on:
         type: string
 
 permissions:
+  id-token: write
   contents: read
 
 concurrency:
@@ -20,11 +21,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
   TF_IN_AUTOMATION: "true"
   TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
@@ -63,6 +61,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/aws-setup
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v4
         with:

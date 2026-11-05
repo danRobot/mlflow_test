@@ -1,14 +1,27 @@
-# MLflow en AWS Learner Lab con Terraform y GitHub Actions
+# MLflow en AWS con Terraform y GitHub Actions
 
 | Pieza | Qué hace |
 |---|---|
 | **ECR** | Imagen del servidor (`infra/mlflow-server`). El workflow la construye solo cuando esa carpeta cambia. |
-| **EC2** | Amazon Linux 2023 con Docker Compose: MLflow + Postgres. Usa el `LabInstanceProfile` del lab (el Learner Lab no deja crear roles). Sin SSH: el deploy entra por SSM. |
+| **EC2** | Amazon Linux 2023 con Docker Compose: MLflow + Postgres. Sin SSH: el deploy entra por SSM. |
 | **S3** | Modelos y artefactos de MLflow (`s3://<bucket>/artifacts`) y estado de Terraform. |
 
 No hay bootstrap: el workflow de deploy crea con la AWS CLI los dos buckets (estado y artefactos) si no existen, y el de destroy los borra al final. No los gestiona Terraform porque el provider de AWS lee siempre la configuración de Object Lock de los buckets y la política del Learner Lab lo prohíbe.
 
-## 1. Configurar GitHub (una vez)
+Crea el bucket del estado, el rol que GitHub Actions asume por OIDC (sin access keys) y el rol de la instancia EC2.
+Necesitas Terraform 1.11 o superior y credenciales de administrador de la cuenta.
+
+```bash
+cd infra/bootstrap
+terraform init
+terraform apply -var github_repo=<owner>/<repo>
+```
+
+- Si la cuenta ya tiene el proveedor OIDC de GitHub, añade `-var create_oidc_provider=false`.
+- Si tu rama principal no es `main`, añade `-var github_branch=<rama>`.
+- Guarda el `terraform.tfstate` que queda en esa carpeta. No se sube al repo.
+
+## 2. Configurar GitHub
 
 En **Settings → Secrets and variables → Actions**:
 
@@ -16,15 +29,18 @@ En **Settings → Secrets and variables → Actions**:
 - **Secret** `POSTGRES_PASSWORD`: clave del usuario `mlflow` de Postgres (al menos 8 caracteres; solo letras, números y `. _ ~ -`, porque va dentro de la URL de conexión). Lo exige el deploy.
 - **Variable opcional** `AWS_REGION`: `us-east-1` (por defecto) o `us-west-2`, las únicas que permite el lab.
 
-## 2. En cada sesión del lab
-
-Las credenciales cambian cada vez que inicias el lab y caducan cuando termina la sesión (unas 4 horas).
-
-1. **Start Lab** y espera a que el indicador esté en verde.
-2. Actualiza los tres secrets `AWS_*` con los valores nuevos de **AWS Details**.
-3. Lanza el workflow que necesites.
-
 ## 3. Desplegar y destruir
+
+- **Actions → deploy → Run workflow**: crea o actualiza todo y despliega. La URL aparece en el resumen del run.
+- **Actions → destroy → Run workflow**, escribiendo `destroy`: borra todo, incluidos runs, métricas, modelos e imágenes. El bootstrap (estado y roles, sin costo) se queda.
+
+Después de un destroy, el siguiente deploy tiene IP nueva: cámbiala en el notebook (`ip='<IP>:8080'`).
+
+Con clave activada, define en el notebook `MLFLOW_TRACKING_USERNAME=admin` y `MLFLOW_TRACKING_PASSWORD`. La clave se fija cuando se crea el servidor: cambiar el secret después no la cambia (haz destroy y deploy, o cámbiala desde MLflow). MLflow va por HTTP, así que la clave viaja sin cifrar.
+
+Costo aproximado en us-east-1 con el stack desplegado: unos US$20 al mes (t3.small, IP pública y 20 GB de disco). Después de destroy, casi cero (solo el bucket del estado).
+
+El rol de GitHub puede gestionar EC2, ECR y SSM en toda la cuenta (de IAM solo pasar el rol de la instancia): lo ideal es una cuenta dedicada a esto.
 
 - **Actions → deploy → Run workflow**: etapas `config` (credenciales y buckets) → `terraform` → `build` (imagen en ECR) → `deploy` (EC2 por SSM). La URL aparece en el resumen del run. Si la sesión anterior detuvo la EC2, el deploy la vuelve a encender.
 - **Actions → destroy → Run workflow**, escribiendo `destroy`: etapas `config` → `terraform` → `limpieza`. Borra todo, incluidos runs, métricas, modelos, imágenes, logs, los parámetros de Parameter Store que creó Terraform y el bucket del estado. La cuenta queda vacía.
@@ -64,7 +80,7 @@ Para saber **quién** detuvo la instancia, usa CloudTrail → Historial de event
 
 No hay métricas, alarmas ni agente de CloudWatch, que sí tienen costo fijo. CloudWatch Logs cobra US$0.50 por GB ingerido. Cada línea de acceso ocupa unos 150 bytes, así que 10 000 peticiones salen por menos de US$0.001, y el healthcheck suma unos 0.4 MB por día con la EC2 encendida. Cada consulta de Logs Insights cuesta US$0.005 por GB leído.
 
-Al terminar la sesión el lab detiene la EC2, pero la IP es fija (Elastic IP) y los datos se conservan. En la sesión siguiente, lanza deploy (o enciende la instancia desde la consola de EC2) y MLflow vuelve con la misma IP. La IP solo cambia después de un destroy o de un reset del lab.
+Desde tu máquina, con las mismas credenciales de administrador del bootstrap:
 
 MLflow no pide usuario ni clave. La única clave es la de Postgres, que no se expone a internet (Postgres no publica puertos). Cada deploy aplica el valor actual del secret `POSTGRES_PASSWORD` a la base, aunque ya existiera con otra clave. Dentro de la instancia está en `/opt/mlflow/.env`, y en AWS en Parameter Store (`/mlflow/postgres-password`).
 
