@@ -3,7 +3,8 @@ name: mlflow-stack
 # Lo despliega infra/deploy.sh en la EC2, que tambien genera el .env
 # (imagen de ECR, IP publica, bucket de S3). No hace falta editar nada aqui.
 
-# Rotacion de logs: MLflow registra cada peticion y el disco es de 20 GB.
+# Rotacion de logs locales (el disco es de 20 GB). MLflow, que registra cada
+# peticion, usa ademas el driver awslogs: ver su bloque `logging`.
 x-logging: &logging
   driver: json-file
   options:
@@ -57,17 +58,25 @@ services:
       # peticiones que llegan desde Colab con la IP publica.
       MLFLOW_PUBLIC_HOST: ${MLFLOW_PUBLIC_HOST:?Define MLFLOW_PUBLIC_HOST en .env}
       MLFLOW_PUBLIC_PORT: 8080
-      MLFLOW_AUTH_ENABLED: ${MLFLOW_AUTH_ENABLED:-false}
-      MLFLOW_AUTH_USERNAME: admin
-      MLFLOW_AUTH_PASSWORD: ${MLFLOW_AUTH_PASSWORD:-}
       # Sin los procesos de jobs de GenAI (no se usan aqui): MLflow pasa de
       # ~1.9 GB a ~0.6 GB de RAM y cabe en una t3.small junto a Postgres.
       MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"
     ports:
       - "8080:8080"
-    volumes:
-      - mlflow-auth:/mlflow/auth
-    logging: *logging
+    # Salida a CloudWatch Logs (log group /mlflow/server): una linea por
+    # peticion con la IP remota. Docker la envia con el rol de la EC2.
+    # non-blocking: si CloudWatch falla, MLflow arranca igual y Docker
+    # reintenta. `docker compose logs` sigue funcionando con la copia local
+    # (cache-*), rotada como la de Postgres.
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_DEFAULT_REGION:?Define AWS_DEFAULT_REGION en .env}
+        awslogs-group: ${SERVER_LOG_GROUP:?Define SERVER_LOG_GROUP en .env}
+        awslogs-stream: mlflow-server
+        mode: non-blocking
+        cache-max-size: "10m"
+        cache-max-file: "3"
     networks:
       - mlflow-net
 
@@ -78,8 +87,6 @@ services:
 volumes:
   mlflow-pgdata:
     name: mlflow-pgdata
-  mlflow-auth:
-    name: mlflow-auth
 
 networks:
   mlflow-net:

@@ -1,7 +1,6 @@
 name: deploy
 
-# Crea o actualiza la infraestructura (Terraform), construye la imagen del
-# servidor en ECR si cambio infra/mlflow-server/ y la despliega en la EC2 por SSM.
+# Etapas: config -> terraform -> build (imagen en ECR) -> deploy (EC2 por SSM)
 on:
   workflow_dispatch:
 
@@ -18,20 +17,53 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
   TF_IN_AUTOMATION: "true"
-  TF_VAR_region: ${{ vars.AWS_REGION }}
-  TF_VAR_mlflow_auth_password: ${{ secrets.MLFLOW_AUTH_PASSWORD }}
+  TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_VAR_postgres_password: ${{ secrets.POSTGRES_PASSWORD }}
 
 jobs:
-  deploy:
+  config:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    steps:
+      - name: Secret POSTGRES_PASSWORD
+        run: |
+          if [ -z "$TF_VAR_postgres_password" ]; then
+            echo "::error::Falta el secret POSTGRES_PASSWORD (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
+
+      - name: Crear buckets si no existen
+        run: |
+          # Con la CLI: Terraform no puede gestionar buckets en el Learner Lab
+          # (ver infra/terraform/main.tf).
+          create() {
+            if [ "$AWS_REGION" = us-east-1 ]; then
+              aws s3api create-bucket --bucket "$1" >/dev/null
+            else
+              aws s3api create-bucket --bucket "$1" \
+                --create-bucket-configuration "LocationConstraint=${AWS_REGION}" >/dev/null
+            fi
+            echo "Bucket creado: $1"
+          }
+          [ "$STATE_BUCKET_EXISTS" = true ] || create "$TF_STATE_BUCKET"
+          [ "$ARTIFACTS_BUCKET_EXISTS" = true ] || create "$ARTIFACTS_BUCKET"
+
+  terraform:
+    needs: config
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      instance_id: ${{ steps.apply.outputs.instance_id }}
+      public_ip: ${{ steps.apply.outputs.public_ip }}
+      postgres_parameter: ${{ steps.apply.outputs.postgres_parameter }}
+      log_group: ${{ steps.apply.outputs.log_group }}
+      server_log_group: ${{ steps.apply.outputs.server_log_group }}
     steps:
       - uses: actions/checkout@v7
-
-      - uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+      - uses: ./.github/actions/aws-setup
 
       - uses: hashicorp/setup-terraform@v4
         with:
@@ -39,37 +71,63 @@ jobs:
           terraform_wrapper: false # el wrapper ensucia la salida de `terraform output`
 
       - name: Terraform apply
+        id: apply
         working-directory: infra/terraform
         run: |
           terraform init -input=false \
             -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="region=${AWS_REGION}"
           terraform apply -input=false -auto-approve
-          for name in ecr_repository_url instance_id public_ip artifacts_bucket auth_parameter; do
-            value=$(terraform output -raw "$name")
-            echo "${name^^}=${value}" >> "$GITHUB_ENV"
+          for name in instance_id public_ip postgres_parameter log_group server_log_group; do
+            echo "${name}=$(terraform output -raw "$name")" >> "$GITHUB_OUTPUT"
           done
 
+  build:
+    needs: terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      image_tag: ${{ steps.image.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
+
       - name: Imagen en ECR
+        id: image
         run: |
           # El tag es el hash git de infra/mlflow-server: solo se reconstruye si cambia.
           tag=$(git rev-parse HEAD:infra/mlflow-server)
-          image="${ECR_REPOSITORY_URL}:${tag}"
-          echo "IMAGE=${image}" >> "$GITHUB_ENV"
-          if aws ecr describe-images --repository-name "${ECR_REPOSITORY_URL#*/}" \
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if aws ecr describe-images --repository-name "${ECR_REPOSITORY#*/}" \
               --image-ids "imageTag=${tag}" >/dev/null 2>&1; then
-            echo "La imagen ${image} ya existe; no se reconstruye."
+            echo "La imagen ${tag} ya existe en ECR; no se reconstruye."
             exit 0
           fi
-          aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPOSITORY_URL%%/*}"
-          docker build -t "${image}" infra/mlflow-server
-          docker push "${image}"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPOSITORY%%/*}"
+          docker build -t "${ECR_REPOSITORY}:${tag}" infra/mlflow-server
+          docker push "${ECR_REPOSITORY}:${tag}"
+
+  deploy:
+    needs: [terraform, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      INSTANCE_ID: ${{ needs.terraform.outputs.instance_id }}
+      PUBLIC_IP: ${{ needs.terraform.outputs.public_ip }}
+      POSTGRES_PARAMETER: ${{ needs.terraform.outputs.postgres_parameter }}
+      LOG_GROUP: ${{ needs.terraform.outputs.log_group }}
+      SERVER_LOG_GROUP: ${{ needs.terraform.outputs.server_log_group }}
+      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
 
       - name: Deploy en la EC2 (SSM)
         run: |
-          # compose y deploy.sh viajan por S3; la instancia los descarga y ejecuta.
-          aws s3 cp docker-compose.yml "s3://${ARTIFACTS_BUCKET}/deploy/docker-compose.yml"
-          aws s3 cp infra/deploy.sh "s3://${ARTIFACTS_BUCKET}/deploy/deploy.sh"
+          # Los archivos viajan por S3; la instancia los descarga y ejecuta deploy.sh.
+          for f in docker-compose.yml infra/deploy.sh infra/oom-alert.sh; do
+            aws s3 cp "$f" "s3://${ARTIFACTS_BUCKET}/deploy/$(basename "$f")"
+          done
 
           echo "Esperando a que la instancia se registre en SSM..."
           status=""
@@ -80,12 +138,14 @@ jobs:
             [ "$status" = "Online" ] && break
             sleep 10
           done
-          [ "$status" = "Online" ] || { echo "La instancia no aparece en SSM"; exit 1; }
+          [ "$status" = "Online" ] || { echo "::error::La instancia no aparece en SSM"; exit 1; }
 
           cmd="mkdir -p /opt/mlflow"
           cmd+=" && aws s3 cp s3://${ARTIFACTS_BUCKET}/deploy/ /opt/mlflow/ --recursive --quiet"
-          cmd+=" && MLFLOW_IMAGE=${IMAGE} MLFLOW_PUBLIC_HOST=${PUBLIC_IP} ARTIFACTS_BUCKET=${ARTIFACTS_BUCKET}"
-          cmd+=" AWS_REGION=${AWS_REGION} AUTH_PARAMETER=${AUTH_PARAMETER} bash /opt/mlflow/deploy.sh"
+          cmd+=" && MLFLOW_IMAGE=${ECR_REPOSITORY}:${IMAGE_TAG} MLFLOW_PUBLIC_HOST=${PUBLIC_IP}"
+          cmd+=" ARTIFACTS_BUCKET=${ARTIFACTS_BUCKET} AWS_REGION=${AWS_REGION}"
+          cmd+=" POSTGRES_PARAMETER=${POSTGRES_PARAMETER} LOG_GROUP=${LOG_GROUP}"
+          cmd+=" SERVER_LOG_GROUP=${SERVER_LOG_GROUP} bash /opt/mlflow/deploy.sh"
           id=$(aws ssm send-command --instance-ids "${INSTANCE_ID}" \
             --document-name AWS-RunShellScript --comment "deploy ${GITHUB_SHA::7}" \
             --parameters "$(jq -cn --arg c "$cmd" '{commands: [$c]}')" \
@@ -99,6 +159,9 @@ jobs:
           done
           aws ssm get-command-invocation --command-id "$id" --instance-id "${INSTANCE_ID}" \
             --query '[StandardOutputContent, StandardErrorContent]' --output text
-          [ "$status" = "Success" ] || { echo "Deploy: ${status}"; exit 1; }
+          [ "$status" = "Success" ] || { echo "::error::Deploy: ${status}"; exit 1; }
 
-          echo "### MLflow: http://${PUBLIC_IP}:8080" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### MLflow: http://${PUBLIC_IP}:8080"
+            echo "Accesos por IP: CloudWatch > Logs Insights > Saved queries > \`mlflow/accesos-por-ip\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,5 +1,3 @@
-data "aws_caller_identity" "current" {}
-
 # Amazon Linux 2023: trae el agente de SSM y la AWS CLI instalados.
 data "aws_ami" "al2023" {
   most_recent = true
@@ -104,21 +102,25 @@ resource "aws_security_group" "mlflow" {
 }
 
 # ---------------------------------------------------------------------------
-# Artefactos (modelos) en S3. force_destroy: destroy lo vacia y lo borra.
-#   artifacts/ -> lo que guarda MLflow
-#   deploy/    -> compose y deploy.sh que sube el workflow
+# El bucket de artefactos NO lo gestiona Terraform: el provider lee siempre su
+# configuracion de Object Lock y la politica (SCP) del Learner Lab lo prohibe.
+# Lo crea el workflow de deploy con la CLI y lo borra el de destroy.
+#
+# Estos bloques sacan del estado el bucket de versiones anteriores sin leerlo
+# ni borrarlo. Se pueden quitar cuando ya no quede ningun estado antiguo.
 # ---------------------------------------------------------------------------
-resource "aws_s3_bucket" "artifacts" {
-  bucket        = "${var.project}-artifacts-${data.aws_caller_identity.current.account_id}-${var.region}"
-  force_destroy = true
+removed {
+  from = aws_s3_bucket.artifacts
+  lifecycle {
+    destroy = false
+  }
 }
 
-resource "aws_s3_bucket_public_access_block" "artifacts" {
-  bucket                  = aws_s3_bucket.artifacts.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+removed {
+  from = aws_s3_bucket_public_access_block.artifacts
+  lifecycle {
+    destroy = false
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -130,14 +132,14 @@ resource "aws_ecr_repository" "mlflow" {
   force_delete         = true
 }
 
-# Clave de la UI (opcional). Write-only: no queda guardada en el estado.
-# La instancia la lee en cada deploy.
-resource "aws_ssm_parameter" "auth" {
-  count            = nonsensitive(var.mlflow_auth_password != "") ? 1 : 0
-  name             = "/${var.project}/auth-password"
+# Clave de Postgres (secret POSTGRES_PASSWORD). Write-only: no queda en el
+# estado. La version sale de un hash de la clave, asi que cambiar el secret
+# actualiza el parametro; deploy.sh lo lee y fija la clave en la base.
+resource "aws_ssm_parameter" "postgres" {
+  name             = "/${var.project}/postgres-password"
   type             = "SecureString"
-  value_wo         = var.mlflow_auth_password
-  value_wo_version = 1
+  value_wo         = var.postgres_password
+  value_wo_version = parseint(substr(sha256(var.postgres_password), 0, 8), 16)
 }
 
 # ---------------------------------------------------------------------------
@@ -177,4 +179,107 @@ resource "aws_eip" "mlflow" {
   tags     = { Name = "${var.project}-server" }
 
   depends_on = [aws_internet_gateway.this]
+}
+
+# ---------------------------------------------------------------------------
+# Registro de errores en CloudWatch Logs al minimo costo: sin metricas, sin
+# alarmas y sin agente. Solo llegan eventos sueltos de ~1 KB, y CloudWatch Logs
+# cobra US$0.50 por GB ingerido: fracciones de centavo al mes.
+#   - Apagados de la EC2 (stopping, stopped, shutting-down, terminated):
+#     EventBridge, gratis para eventos de AWS dentro de la misma cuenta.
+#   - Falta de memoria (OOM killer): lo envia infra/oom-alert.sh desde la EC2.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_log_group" "ec2" {
+  name              = "/${var.project}/ec2"
+  retention_in_days = 7
+}
+
+resource "aws_cloudwatch_event_rule" "ec2_state" {
+  name        = "${var.project}-ec2-apagado"
+  description = "Apagados y terminaciones de la EC2 de MLflow"
+
+  event_pattern = jsonencode({
+    source        = ["aws.ec2"]
+    "detail-type" = ["EC2 Instance State-change Notification"]
+    detail = {
+      "instance-id" = [aws_instance.mlflow.id]
+      state         = ["stopping", "stopped", "shutting-down", "terminated"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "ec2_state" {
+  rule = aws_cloudwatch_event_rule.ec2_state.name
+  arn  = aws_cloudwatch_log_group.ec2.arn
+}
+
+# Permite a EventBridge escribir en el log group (politica de recurso, sin roles).
+resource "aws_cloudwatch_log_resource_policy" "eventbridge" {
+  policy_name = "${var.project}-eventbridge"
+
+  policy_document = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = ["events.amazonaws.com", "delivery.logs.amazonaws.com"] }
+      Action    = ["logs:CreateLogStream", "logs:PutLogEvents"]
+      Resource  = "${aws_cloudwatch_log_group.ec2.arn}:*"
+    }]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# Accesos a MLflow. Docker envia aqui la salida del contenedor con su driver
+# awslogs (sin agente): una linea por peticion con la IP remota, mas avisos y
+# errores del servidor. Cada linea son ~150 bytes, asi que incluso con
+# escaneos de internet son centavos al mes.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_log_group" "server" {
+  name              = "/${var.project}/server"
+  retention_in_days = 30
+}
+
+# Consultas guardadas en CloudWatch > Logs Insights > Saved queries (gratis;
+# cada ejecucion cobra US$0.005 por GB leido). Solo cuentan IPs publicas: asi
+# quedan fuera el healthcheck de Docker (127.0.0.1) y las peticiones de la
+# propia instancia, que llegan desde la red de Docker (172.16.0.0/12).
+locals {
+  # Linea de acceso de uvicorn (formato de MLflow 3.x):
+  #   2026/11/02 22:41:43 INFO:     203.0.113.7:48740 - "GET /api/2.0/... HTTP/1.1" 200 OK
+  accesos_publicos = trimspace(<<-EOT
+    parse @message /(?<ip>\d+\.\d+\.\d+\.\d+):\d+ - "(?<metodo>\S+) (?<ruta>\S+) [^"]+" (?<estado>\d+)/
+    | filter isPublicIP(ip)
+  EOT
+  )
+}
+
+resource "aws_cloudwatch_query_definition" "accesos_por_ip" {
+  name            = "${var.project}/accesos-por-ip"
+  log_group_names = [aws_cloudwatch_log_group.server.name]
+  query_string    = <<-EOT
+    ${local.accesos_publicos}
+    | stats count(*) as accesos, countDistinct(ruta) as rutas, earliest(@timestamp) as primero, latest(@timestamp) as ultimo by ip
+    | sort accesos desc
+    | limit 1000
+  EOT
+}
+
+resource "aws_cloudwatch_query_definition" "accesos_por_hora" {
+  name            = "${var.project}/accesos-por-hora"
+  log_group_names = [aws_cloudwatch_log_group.server.name]
+  query_string    = <<-EOT
+    ${local.accesos_publicos}
+    | stats count(*) as accesos, countDistinct(ip) as ips by bin(1h)
+  EOT
+}
+
+resource "aws_cloudwatch_query_definition" "accesos_detalle" {
+  name            = "${var.project}/accesos-detalle"
+  log_group_names = [aws_cloudwatch_log_group.server.name]
+  query_string    = <<-EOT
+    ${local.accesos_publicos}
+    | fields @timestamp, ip, metodo, ruta, estado
+    | sort @timestamp desc
+    | limit 1000
+  EOT
 }

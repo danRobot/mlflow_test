@@ -1,7 +1,9 @@
 name: destroy
 
-# Borra TODO lo que crea Terraform: servidor, base de datos (runs y metricas),
-# modelos en S3 e imagenes en ECR. El bootstrap (estado y rol de GitHub) se queda.
+# Etapas: config -> terraform (destroy) -> limpieza
+# Borra TODO: servidor, base de datos (runs y metricas), modelos en S3,
+# imagenes en ECR, logs, los parametros de Parameter Store que creo Terraform
+# y el bucket del estado. La cuenta queda vacia.
 on:
   workflow_dispatch:
     inputs:
@@ -22,16 +24,43 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
   TF_IN_AUTOMATION: "true"
-  TF_VAR_region: ${{ vars.AWS_REGION }}
-  TF_VAR_mlflow_auth_password: ${{ secrets.MLFLOW_AUTH_PASSWORD }}
+  TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
 jobs:
-  destroy:
-    if: inputs.confirm == 'destroy'
+  config:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      has_state: ${{ steps.state.outputs.has_state }}
+    steps:
+      - name: Confirmacion
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != destroy ]; then
+            echo "::error::Escribe destroy en el campo de confirmacion para borrar todo."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
+
+      - name: Estado de Terraform
+        id: state
+        run: |
+          echo "has_state=${STATE_BUCKET_EXISTS}" >> "$GITHUB_OUTPUT"
+          if [ "$STATE_BUCKET_EXISTS" != true ]; then
+            echo "No existe el bucket del estado: no hay stack que destruir."
+          fi
+
+  terraform:
+    needs: config
+    if: needs.config.outputs.has_state == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
 
       - uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -49,3 +78,52 @@ jobs:
             -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="region=${AWS_REGION}"
           terraform destroy -input=false -auto-approve
+
+  # Corre si terraform termino bien o se salto porque no habia estado.
+  limpieza:
+    needs: [config, terraform]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
+
+      # Va antes de borrar los buckets: si falla, el estado de Terraform se
+      # conserva y se puede repetir el destroy.
+      - name: Borrar parametros de Terraform
+        run: |
+          # Todos los parametros de Parameter Store que creo Terraform: llevan
+          # las default_tags del provider (Project=mlflow, ManagedBy=terraform),
+          # asi que se encuentran aunque ya no esten en el estado (por ejemplo
+          # tras reiniciar el lab), en cuyo caso harian fallar el siguiente
+          # deploy con ParameterAlreadyExists. Si habia estado, terraform
+          # destroy ya los borro y aqui no queda ninguno. Sus valores vienen de
+          # secrets de GitHub: deploy los vuelve a crear.
+          filters='[{"Key":"tag:Project","Values":["mlflow"]},{"Key":"tag:ManagedBy","Values":["terraform"]}]'
+          names=$(aws ssm describe-parameters --parameter-filters "$filters" \
+            --query 'Parameters[].Name' --output text)
+          if [ -z "$names" ] || [ "$names" = None ]; then
+            echo "No quedan parametros de Terraform."
+            exit 0
+          fi
+          for name in $names; do
+            if err=$(aws ssm delete-parameter --name "$name" 2>&1); then
+              echo "Parametro borrado: $name"
+            else
+              case "$err" in
+                *ParameterNotFound*) echo "Ya no existia: $name" ;;
+                *) echo "::error::No se pudo borrar el parametro $name: ${err}"; exit 1 ;;
+              esac
+            fi
+          done
+
+      - name: Borrar buckets
+        run: |
+          # Artefactos (modelos) primero; el del estado al final, ya vacio.
+          if [ "$ARTIFACTS_BUCKET_EXISTS" = true ]; then
+            aws s3 rb "s3://${ARTIFACTS_BUCKET}" --force
+          fi
+          if [ "$STATE_BUCKET_EXISTS" = true ]; then
+            aws s3 rb "s3://${TF_STATE_BUCKET}" --force
+          fi

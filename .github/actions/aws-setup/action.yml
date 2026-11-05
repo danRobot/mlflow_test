@@ -1,0 +1,51 @@
+name: aws-setup
+description: >-
+  Comprueba que las credenciales del Learner Lab funcionan, oculta en los logs
+  la cuenta y la sesion, y exporta los nombres de los buckets y si existen.
+
+runs:
+  using: composite
+  steps:
+    - name: Credenciales y buckets
+      shell: bash
+      run: |
+        set -euo pipefail
+        fail() {
+          echo "::error::Credenciales invalidas, caducadas o revocadas. Copia de nuevo los tres valores de AWS Details del Learner Lab a los secrets."
+          exit 1
+        }
+        ident=$(aws sts get-caller-identity --query '[Account, Arn]' --output text 2>/dev/null) || fail
+        account=${ident%%[[:space:]]*}
+        arn=${ident##*[[:space:]]}
+        echo "::add-mask::${account}"
+        echo "::add-mask::${arn##*/}" # sesion del lab: lleva tu nombre
+
+        # GetCallerIdentity responde aunque el lab haya revocado las credenciales
+        # (ninguna politica puede denegarlo), asi que se prueban tambien con EC2.
+        aws ec2 describe-availability-zones --query 'AvailabilityZones[0].ZoneName' \
+          --output text >/dev/null 2>&1 || fail
+
+        # Imprime true o false. Cualquier error distinto de 404 (permisos,
+        # credenciales, region) detiene el workflow en vez de suponer "no existe".
+        exists() {
+          local err
+          if err=$(aws s3api head-bucket --bucket "$1" 2>&1); then
+            echo true
+            return
+          fi
+          case "$err" in
+            *"(404)"*) echo false ;;
+            *) echo "::error::No se pudo comprobar el bucket $1: ${err}" >&2; return 1 ;;
+          esac
+        }
+        state="mlflow-tfstate-${account}-${AWS_REGION}"
+        artifacts="mlflow-artifacts-${account}-${AWS_REGION}"
+        state_exists=$(exists "$state")
+        artifacts_exists=$(exists "$artifacts")
+        {
+          echo "TF_STATE_BUCKET=${state}"
+          echo "ARTIFACTS_BUCKET=${artifacts}"
+          echo "STATE_BUCKET_EXISTS=${state_exists}"
+          echo "ARTIFACTS_BUCKET_EXISTS=${artifacts_exists}"
+          echo "ECR_REPOSITORY=${account}.dkr.ecr.${AWS_REGION}.amazonaws.com/mlflow-server"
+        } >> "$GITHUB_ENV"

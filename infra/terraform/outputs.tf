@@ -15,11 +15,17 @@ output "ecr_repository_url" {
   value = aws_ecr_repository.mlflow.repository_url
 }
 
-output "artifacts_bucket" {
-  value = aws_s3_bucket.artifacts.bucket
+output "postgres_parameter" {
+  description = "Parametro SSM con la clave de Postgres"
+  value       = aws_ssm_parameter.postgres.name
 }
 
-output "auth_parameter" {
-  description = "Parametro SSM con la clave de la UI (vacio si no hay auth)"
-  value       = try(aws_ssm_parameter.auth[0].name, "")
+output "log_group" {
+  description = "Log group de CloudWatch con apagados y errores de memoria de la EC2"
+  value       = aws_cloudwatch_log_group.ec2.name
+}
+
+output "server_log_group" {
+  description = "Log group de CloudWatch con la salida de MLflow: accesos con IP remota y errores"
+  value       = aws_cloudwatch_log_group.server.name
 }

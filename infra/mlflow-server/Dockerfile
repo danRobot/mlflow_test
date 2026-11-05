@@ -9,7 +9,7 @@ FROM python:3.11-slim
 COPY --from=ghcr.io/astral-sh/uv:0.12.10 /uv /bin/uv
 
 # Manten esta version alineada con la que instalas en Colab.
-ARG MLFLOW_VERSION=3.16.0
+ARG MLFLOW_VERSION=3.17.0
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -22,10 +22,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
-# mlflow[auth] trae Flask-WTF, necesario para basic-auth.
 # psycopg2-binary para PostgreSQL. boto3 para guardar los artefactos en S3.
 RUN uv pip install --system \
-        "mlflow[auth]==${MLFLOW_VERSION}" \
+        "mlflow==${MLFLOW_VERSION}" \
         "psycopg2-binary==2.9.10" \
         "boto3==1.35.99"
 
@@ -37,7 +36,6 @@ RUN uv pip install --system \
 # ---------------------------------------------------------------------------
 
 WORKDIR ${MLFLOW_HOME}
-RUN mkdir -p ${MLFLOW_HOME}/auth
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
