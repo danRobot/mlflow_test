@@ -4,6 +4,7 @@
 # dependencies = [
 #     # La misma version que el servidor (infra/mlflow-server/Dockerfile).
 #     "mlflow-skinny==3.17.0",
+#     "tqdm==4.70.1",
 # ]
 # ///
 """Respaldo de MLflow en tu computador, solo con la API de MLflow.
@@ -27,7 +28,7 @@ Uso (la URL sale en el resumen del deploy):
   uv run scripts/backup_local.py --tracking-uri http://IP:8080
 
   o, sin uv:
-  pip install mlflow-skinny==3.17.0
+  pip install mlflow-skinny==3.17.0 tqdm==4.70.1
   python scripts/backup_local.py --tracking-uri http://IP:8080
 
 Opciones:
@@ -47,6 +48,9 @@ Resultado:
     experiments/<id>/models/<model_id>/artifacts/...
     registered_models/<nombre>.json     modelo, versiones y alias
 
+Muestra dos barras de progreso: metadatos (corridas y modelos leidos) y
+artefactos (bytes descargados, velocidad y tiempo restante).
+
 Notas:
   - Se escribe en una carpeta .partial que solo se renombra al terminar
     bien: nunca queda un respaldo a medias con aspecto de completo.
@@ -61,6 +65,7 @@ Notas:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import enum
 import json
@@ -71,16 +76,24 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 # Un respaldo no tiene por que mandar telemetria a terceros.
 os.environ.setdefault("MLFLOW_DISABLE_TELEMETRY", "true")
+# Las barras de MLflow (una por corrida y archivo) las reemplaza la barra general.
+os.environ.setdefault("MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR", "false")
+# MLflow baja cada archivo del bucket en partes de 100 MB y la barra avanza con
+# cada parte terminada: con 8 MB avanza seguido.
+os.environ.setdefault("MLFLOW_MULTIPART_DOWNLOAD_CHUNK_SIZE", str(8 * 1024 * 1024))
 
 import mlflow  # noqa: E402
 import requests  # noqa: E402
 from mlflow import MlflowClient  # noqa: E402
 from mlflow.entities import ViewType  # noqa: E402
+from mlflow.store.artifact import http_artifact_repo  # noqa: E402
+from tqdm import tqdm  # noqa: E402
 
 NAME_RE = re.compile(r"^mlflow-backup-\d{8}-\d{6}$")
 
@@ -92,6 +105,14 @@ def log(msg: str) -> None:
 def die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def abort(msg: str) -> None:
+    """Como die, pero sin esperar a las descargas que MLflow siga haciendo en
+    otros hilos: al salir normal, Python esperaria a que terminen."""
+    sys.stdout.flush()
+    print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+    os._exit(1)
 
 
 def to_json(obj):
@@ -132,12 +153,55 @@ def safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "modelo"
 
 
+class Progress:
+    """Barra de bytes que pueden avanzar varios hilos a la vez."""
+
+    def __init__(self, bar: tqdm):
+        self.bar = bar
+        self.done = 0
+        self._lock = threading.Lock()
+
+    def add(self, n: int) -> None:
+        with self._lock:
+            self.done += n
+            self.bar.update(n)
+
+
+@contextlib.contextmanager
+def chunk_progress(bar: tqdm):
+    """Suma a la barra cada parte de archivo que MLflow termina de bajar.
+
+    Con S3 detras, MLflow 3 baja cada archivo directo del bucket (URL
+    prefirmada), en partes paralelas, y no informa del avance: mientras dura el
+    bloque se envuelve su funcion que baja cada parte.
+    """
+    progress = Progress(bar)
+    original = getattr(http_artifact_repo, "download_chunk", None)
+    if original is None:  # otra version de MLflow: la barra avanza por corrida
+        yield progress
+        return
+
+    def download_chunk(*args, **kwargs):
+        original(*args, **kwargs)
+        start, end = kwargs.get("range_start"), kwargs.get("range_end")
+        if start is not None and end is not None:
+            progress.add(end - start + 1)
+
+    http_artifact_repo.download_chunk = download_chunk
+    try:
+        yield progress
+    finally:
+        http_artifact_repo.download_chunk = original
+
+
 class Artifacts:
-    """Descarga artefactos, o los enlaza del respaldo anterior si no cambiaron."""
+    """Artefactos: primero se listan (y se enlazan los que no cambiaron), despues
+    se descargan los demas con una sola barra de bytes."""
 
     def __init__(self, tracking_uri: str, previous: Path | None):
         self.tracking_uri = tracking_uri
         self.previous = previous
+        self.pending: list[tuple[str, Path, dict[str, int], str]] = []
         self.downloaded = self.reused = 0
         self.bytes_downloaded = self.bytes_reused = 0
 
@@ -159,32 +223,46 @@ class Artifacts:
             return {}
         return {p.relative_to(root).as_posix(): p.stat().st_size for p in root.rglob("*") if p.is_file()}
 
-    def fetch(self, uri: str, dest: Path, rel_dir: str) -> int:
-        """Deja en `dest` los artefactos de `uri`. Devuelve cuantos archivos hay."""
+    def plan(self, uri: str, dest: Path, rel_dir: str, label: str) -> int:
+        """Enlaza ya los artefactos sin cambios o deja la descarga pendiente.
+        Devuelve cuantos archivos hay."""
         remote = self.remote_files(uri)
         if not remote:
             return 0
-        size = sum(remote.values())
         old = self.previous / rel_dir if self.previous else None
         if old is not None and self.local_files(old) == remote:
             shutil.copytree(old, dest, copy_function=link_or_copy)
             self.reused += len(remote)
-            self.bytes_reused += size
-            return len(remote)
-        # download_artifacts crea una carpeta con el ultimo tramo de la URI.
-        tmp = Path(tempfile.mkdtemp(dir=dest.parent))
-        got = Path(
-            mlflow.artifacts.download_artifacts(
-                artifact_uri=uri, dst_path=str(tmp), tracking_uri=self.tracking_uri
-            )
-        )
-        got.rename(dest)
-        shutil.rmtree(tmp)
-        if self.local_files(dest) != remote:
-            raise RuntimeError(f"la descarga de {uri} no coincide con lo que hay en el servidor")
-        self.downloaded += len(remote)
-        self.bytes_downloaded += size
+            self.bytes_reused += sum(remote.values())
+        else:
+            self.pending.append((uri, dest, remote, label))
         return len(remote)
+
+    def download_pending(self) -> None:
+        if not self.pending:
+            return
+        total = sum(sum(remote.values()) for _, _, remote, _ in self.pending)
+        bar = tqdm(total=total, desc="Descargando", unit="B", unit_scale=True, unit_divisor=1024)
+        with bar, chunk_progress(bar) as progress:
+            for uri, dest, remote, label in self.pending:
+                bar.set_postfix_str(label, refresh=False)
+                size = sum(remote.values())
+                before = progress.done
+                # download_artifacts crea una carpeta con el ultimo tramo de la URI.
+                tmp = Path(tempfile.mkdtemp(dir=dest.parent))
+                got = Path(
+                    mlflow.artifacts.download_artifacts(
+                        artifact_uri=uri, dst_path=str(tmp), tracking_uri=self.tracking_uri
+                    )
+                )
+                # Lo que no llego por partes (a traves del servidor) se suma al terminar.
+                progress.add(size - (progress.done - before))
+                got.rename(dest)
+                shutil.rmtree(tmp)
+                if self.local_files(dest) != remote:
+                    raise RuntimeError(f"la descarga de {uri} no coincide con lo que hay en el servidor")
+                self.downloaded += len(remote)
+                self.bytes_downloaded += size
 
 
 def link_or_copy(src: str, dst: str) -> None:
@@ -209,9 +287,13 @@ def check_server(tracking_uri: str) -> str:
     return server_version
 
 
+def short(text: str, width: int = 28) -> str:
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
 def backup(
     client: MlflowClient, tracking_uri: str, work: Path, previous: Path | None, with_artifacts: bool
-) -> dict:
+) -> tuple[dict, list[str]]:
     arts = Artifacts(tracking_uri, previous)
     counts = {
         "experiments": 0,
@@ -223,55 +305,70 @@ def backup(
         "artifact_files": 0,
     }
 
+    # Que hay que respaldar: se lista primero para que la barra sepa el total.
     experiments = list(paged(client.search_experiments, view_type=ViewType.ACTIVE_ONLY))
+    items = []
+    per_exp: dict[str, list[int]] = {}
     for exp in experiments:
-        exp_dir = work / "experiments" / exp.experiment_id
-        write_json(exp_dir / "experiment.json", exp)
-        n_runs = n_models = n_files = 0
-
-        for run in paged(
+        write_json(work / "experiments" / exp.experiment_id / "experiment.json", exp)
+        per_exp[exp.experiment_id] = [0, 0, 0]  # corridas, modelos, archivos
+        runs = paged(
             client.search_runs, experiment_ids=[exp.experiment_id], run_view_type=ViewType.ACTIVE_ONLY
-        ):
-            run_id = run.info.run_id
-            data = to_json(run)
-            history = {}
-            for key in run.data.metrics:
-                points = client.get_metric_history(run_id, key)
-                history[key] = [{"value": m.value, "timestamp": m.timestamp, "step": m.step} for m in points]
-                counts["metric_points"] += len(points)
-            data["metric_history"] = history
-            run_dir = exp_dir / "runs" / run_id
-            write_json(run_dir / "run.json", data)
-            if with_artifacts:
-                n_files += arts.fetch(
-                    run.info.artifact_uri,
-                    run_dir / "artifacts",
-                    f"experiments/{exp.experiment_id}/runs/{run_id}/artifacts",
-                )
-            n_runs += 1
-
-        for model in paged(client.search_logged_models, experiment_ids=[exp.experiment_id]):
-            model_dir = exp_dir / "models" / model.model_id
-            data = to_json(model)
-            data["status"] = to_json(model.status)  # to_dictionary() lo deja como numero
-            write_json(model_dir / "model.json", data)
-            if with_artifacts and model.artifact_location:
-                n_files += arts.fetch(
-                    model.artifact_location,
-                    model_dir / "artifacts",
-                    f"experiments/{exp.experiment_id}/models/{model.model_id}/artifacts",
-                )
-            n_models += 1
-
-        counts["experiments"] += 1
-        counts["runs"] += n_runs
-        counts["logged_models"] += n_models
-        counts["artifact_files"] += n_files
-        print(
-            f"    {exp.name} (id {exp.experiment_id}): {n_runs} corridas, "
-            f"{n_models} logged models, {n_files} archivos",
-            flush=True,
         )
+        items += [("run", exp, run) for run in runs]
+        items += [
+            ("model", exp, m) for m in paged(client.search_logged_models, experiment_ids=[exp.experiment_id])
+        ]
+        counts["experiments"] += 1
+
+    with tqdm(total=len(items), desc="Metadatos", unit=" elem") as bar:
+        for kind, exp, obj in items:
+            exp_dir = work / "experiments" / exp.experiment_id
+            stats = per_exp[exp.experiment_id]
+            if kind == "run":
+                run_id = obj.info.run_id
+                label = f"{exp.name}/{obj.info.run_name or run_id[:8]}"
+                bar.set_postfix_str(short(label), refresh=False)
+                data = to_json(obj)
+                history = {}
+                for key in obj.data.metrics:
+                    points = client.get_metric_history(run_id, key)
+                    history[key] = [
+                        {"value": m.value, "timestamp": m.timestamp, "step": m.step} for m in points
+                    ]
+                    counts["metric_points"] += len(points)
+                data["metric_history"] = history
+                run_dir = exp_dir / "runs" / run_id
+                write_json(run_dir / "run.json", data)
+                if with_artifacts:
+                    stats[2] += arts.plan(
+                        obj.info.artifact_uri,
+                        run_dir / "artifacts",
+                        f"experiments/{exp.experiment_id}/runs/{run_id}/artifacts",
+                        short(label),
+                    )
+                stats[0] += 1
+                counts["runs"] += 1
+            else:
+                label = f"{exp.name}/{obj.name or obj.model_id}"
+                bar.set_postfix_str(short(label), refresh=False)
+                model_dir = exp_dir / "models" / obj.model_id
+                data = to_json(obj)
+                data["status"] = to_json(obj.status)  # to_dictionary() lo deja como numero
+                write_json(model_dir / "model.json", data)
+                if with_artifacts and obj.artifact_location:
+                    stats[2] += arts.plan(
+                        obj.artifact_location,
+                        model_dir / "artifacts",
+                        f"experiments/{exp.experiment_id}/models/{obj.model_id}/artifacts",
+                        short(label),
+                    )
+                stats[1] += 1
+                counts["logged_models"] += 1
+            bar.update()
+        bar.set_postfix_str("", refresh=True)
+
+    arts.download_pending()
 
     for rm in paged(client.search_registered_models):
         versions = list(paged(client.search_model_versions, filter_string=f"name='{rm.name}'"))
@@ -286,11 +383,17 @@ def backup(
         counts["registered_models"] += 1
         counts["model_versions"] += len(versions)
 
+    counts["artifact_files"] = sum(stats[2] for stats in per_exp.values())
     counts["artifacts_downloaded"] = arts.downloaded
     counts["artifacts_reused"] = arts.reused
     counts["bytes_downloaded"] = arts.bytes_downloaded
     counts["bytes_reused"] = arts.bytes_reused
-    return counts
+    lines = [
+        f"    {exp.name} (id {exp.experiment_id}): {per_exp[exp.experiment_id][0]} corridas, "
+        f"{per_exp[exp.experiment_id][1]} logged models, {per_exp[exp.experiment_id][2]} archivos"
+        for exp in experiments
+    ]
+    return counts, lines
 
 
 def complete_backups(dest: Path) -> list[Path]:
@@ -364,7 +467,7 @@ def main() -> None:
         log(f"Los artefactos sin cambios se enlazan desde {previous.name}")
     start = time.time()
     try:
-        counts = backup(client, tracking_uri, work, previous, not args.no_artifacts)
+        counts, lines = backup(client, tracking_uri, work, previous, not args.no_artifacts)
         write_json(
             work / "manifest.json",
             {
@@ -381,8 +484,8 @@ def main() -> None:
     except BaseException as e:  # tambien Ctrl+C y SIGTERM: nunca queda un .partial
         shutil.rmtree(work, ignore_errors=True)
         if isinstance(e, (KeyboardInterrupt, SystemExit)):
-            die("interrumpido; no se creo ningun respaldo")
-        die(f"respaldo FALLIDO, no se creo ningun respaldo: {e}")
+            abort("interrumpido; no se creo ningun respaldo")
+        abort(f"respaldo FALLIDO, no se creo ningun respaldo: {e}")
 
     # Retencion. Los enlaces (hard links) hacen que borrar un respaldo viejo no
     # afecte a los nuevos que comparten artefactos con el.
@@ -394,6 +497,7 @@ def main() -> None:
     c = counts
     print()
     print(f"Respaldo completo: {final}")
+    print("\n".join(lines))
     print(
         f"  experimentos={c['experiments']} corridas={c['runs']} puntos de metricas={c['metric_points']}"
         f" logged models={c['logged_models']} modelos registrados={c['registered_models']}"
