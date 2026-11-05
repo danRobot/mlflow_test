@@ -1,0 +1,75 @@
+name: stack
+description: >-
+  Lee del estado de Terraform la instancia y el parametro de Google Drive.
+  Con start "true", enciende la EC2 si la sesion anterior del lab la detuvo.
+  Necesita aws-setup antes (bucket del estado).
+
+inputs:
+  start:
+    description: Encender la EC2 si esta detenida
+    required: false
+    default: "true"
+
+outputs:
+  instance_id:
+    description: ID de la EC2 (vacio si no hay stack)
+    value: ${{ steps.info.outputs.instance_id }}
+  gdrive_parameter:
+    description: Parametro SSM de Google Drive (vacio si no esta configurado)
+    value: ${{ steps.info.outputs.gdrive_parameter }}
+  started:
+    description: '"true" si esta accion encendio la EC2'
+    value: ${{ steps.info.outputs.started }}
+
+runs:
+  using: composite
+  steps:
+    - uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: 1.16.7
+        terraform_wrapper: false # el wrapper ensucia la salida de `terraform output`
+
+    - name: Instancia y Google Drive (estado de Terraform)
+      id: info
+      shell: bash
+      working-directory: infra/terraform
+      env:
+        START: ${{ inputs.start }}
+      run: |
+        set -euo pipefail
+        id="" gdrive="" started=false
+        if [ "$STATE_BUCKET_EXISTS" = true ]; then
+          terraform init -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="region=${AWS_REGION}" >/dev/null
+          id=$(terraform output -raw instance_id 2>/dev/null || true)
+          gdrive=$(terraform output -raw gdrive_parameter 2>/dev/null || true)
+        fi
+
+        if [ -z "$id" ]; then
+          echo "No hay ningun stack desplegado."
+        else
+          state=$(aws ec2 describe-instances --instance-ids "$id" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text)
+          echo "EC2 ${id}: ${state}"
+          if [ "$START" = true ]; then
+            case "$state" in
+              stopping) aws ec2 wait instance-stopped --instance-ids "$id"; state=stopped ;;
+              pending) aws ec2 wait instance-running --instance-ids "$id"; state=running ;;
+            esac
+            if [ "$state" = stopped ]; then
+              echo "Encendiendo la EC2 (la sesion anterior del lab la detuvo)..."
+              aws ec2 start-instances --instance-ids "$id" >/dev/null
+              aws ec2 wait instance-running --instance-ids "$id"
+              started=true
+            elif [ "$state" != running ]; then
+              echo "::error::La EC2 esta en estado ${state}"
+              exit 1
+            fi
+          fi
+        fi
+        {
+          echo "instance_id=${id}"
+          echo "gdrive_parameter=${gdrive}"
+          echo "started=${started}"
+        } >> "$GITHUB_OUTPUT"

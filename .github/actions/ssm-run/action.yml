@@ -1,0 +1,76 @@
+name: ssm-run
+description: >-
+  Ejecuta un comando en la EC2 por SSM (AWS-RunShellScript), espera a que
+  termine, muestra su salida y falla si el comando falla.
+
+inputs:
+  instance-id:
+    description: ID de la instancia
+    required: true
+  command:
+    description: Comando de shell que se ejecuta como root en la instancia
+    required: true
+  comment:
+    description: Comentario que queda en el historial de SSM
+    required: false
+    default: ""
+  timeout-minutes:
+    description: Tiempo maximo del comando
+    required: false
+    default: "15"
+
+outputs:
+  output:
+    description: Salida del comando (SSM guarda hasta 24 000 caracteres)
+    value: ${{ steps.run.outputs.output }}
+
+runs:
+  using: composite
+  steps:
+    - name: Comando en la EC2 (SSM)
+      id: run
+      shell: bash
+      env:
+        INSTANCE_ID: ${{ inputs.instance-id }}
+        COMMAND: ${{ inputs.command }}
+        COMMENT: ${{ inputs.comment }}
+        TIMEOUT_MIN: ${{ inputs.timeout-minutes }}
+      run: |
+        set -euo pipefail
+        echo "Esperando a que la instancia se registre en SSM..."
+        status=""
+        for _ in $(seq 60); do
+          status=$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
+            --query 'InstanceInformationList[0].PingStatus' --output text)
+          [ "$status" = "Online" ] && break
+          sleep 10
+        done
+        [ "$status" = "Online" ] || { echo "::error::La instancia no aparece en SSM"; exit 1; }
+
+        # 'exec 2>&1': errores y avisos quedan intercalados con la salida, en orden.
+        params=$(jq -cn --arg c "$COMMAND" --arg t "$((TIMEOUT_MIN * 60))" \
+          '{commands: ["exec 2>&1", $c], executionTimeout: [$t]}')
+        id=$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+          --document-name AWS-RunShellScript --comment "${COMMENT:0:100}" \
+          --parameters "$params" --query Command.CommandId --output text)
+
+        status=Pending
+        for _ in $(seq $((TIMEOUT_MIN * 6 + 6))); do
+          sleep 10
+          status=$(aws ssm get-command-invocation --command-id "$id" --instance-id "$INSTANCE_ID" \
+            --query Status --output text 2>/dev/null || echo Pending)
+          case "$status" in Pending | InProgress | Delayed) ;; *) break ;; esac
+        done
+        out=$(aws ssm get-command-invocation --command-id "$id" --instance-id "$INSTANCE_ID" \
+          --query StandardOutputContent --output text)
+        printf '%s\n' "$out"
+        delim="SSM_$(date +%s%N)"
+        { echo "output<<${delim}"; printf '%s\n' "$out"; echo "${delim}"; } >> "$GITHUB_OUTPUT"
+        case "$status" in
+          Success) ;;
+          Pending | InProgress | Delayed)
+            echo "::error::El comando no termino en ${TIMEOUT_MIN} minutos (sigue en la instancia; ver Systems Manager > Run Command)"
+            exit 1 ;;
+          *) echo "::error::El comando termino con estado ${status}"; exit 1 ;;
+        esac

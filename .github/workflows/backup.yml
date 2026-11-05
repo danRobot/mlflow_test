@@ -1,0 +1,91 @@
+name: backup
+
+# Respaldo de MLflow en Google Drive, a mano. No hace falta para el dia a
+# dia: la EC2 respalda sola cada hora y al apagarse, y destroy respalda antes
+# de borrar. Si la EC2 esta detenida, la enciende y al terminar la detiene.
+on:
+  workflow_dispatch:
+    inputs:
+      detener_servidor:
+        description: "Detener MLflow durante el volcado (respaldo consistente; corta unos segundos a quien este registrando)"
+        type: boolean
+        default: false
+      forzar:
+        description: "Crear un respaldo nuevo aunque la base no haya cambiado"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Nunca a la vez que deploy, destroy o restore.
+concurrency:
+  group: mlflow-infra
+  cancel-in-progress: false
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
+
+      - name: Stack
+        id: stack
+        uses: ./.github/actions/stack
+        with:
+          start: "true"
+
+      - name: Comando
+        id: cmd
+        env:
+          INSTANCE_ID: ${{ steps.stack.outputs.instance_id }}
+          GDRIVE: ${{ steps.stack.outputs.gdrive_parameter }}
+          STOP: ${{ inputs.detener_servidor }}
+          FORCE: ${{ inputs.forzar }}
+        run: |
+          [ -n "$INSTANCE_ID" ] || { echo "::error::No hay ningun stack desplegado: lanza deploy."; exit 1; }
+          [ -n "$GDRIVE" ] || { echo "::error::Google Drive no esta configurado: crea el secret GDRIVE_RCLONE_CONF (ver README) y lanza deploy."; exit 1; }
+          cmd="bash /opt/mlflow/scripts/backup_mlflow.sh"
+          if [ "$STOP" = true ]; then cmd+=" --stop-server"; fi
+          if [ "$FORCE" = true ]; then cmd+=" --force"; fi
+          echo "command=${cmd}" >> "$GITHUB_OUTPUT"
+
+      - name: Respaldo en Google Drive (SSM)
+        id: run
+        uses: ./.github/actions/ssm-run
+        with:
+          instance-id: ${{ steps.stack.outputs.instance_id }}
+          command: ${{ steps.cmd.outputs.command }}
+          comment: respaldo manual
+          timeout-minutes: 60
+
+      - name: Resumen
+        env:
+          OUTPUT: ${{ steps.run.outputs.output }}
+        run: |
+          {
+            echo "### Respaldo de MLflow"
+            grep -E '^(Respaldo completo|Sin cambios|La base esta vacia)' <<<"$OUTPUT" || true
+            grep -E '^  experimentos=' <<<"$OUTPUT" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Volver a detener la EC2
+        if: always() && steps.stack.outputs.started == 'true'
+        env:
+          INSTANCE_ID: ${{ steps.stack.outputs.instance_id }}
+        run: |
+          # Estaba detenida antes del workflow: se deja igual. Al apagarse hace
+          # su respaldo de apagado, que vera la base sin cambios.
+          aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null
+          echo "EC2 detenida de nuevo."

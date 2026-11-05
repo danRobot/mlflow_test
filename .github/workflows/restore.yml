@@ -1,0 +1,115 @@
+name: restore
+
+# Restaura en la EC2 un respaldo de Google Drive. Sin confirmar, solo lista
+# los respaldos (en el resumen del run). Despues de un reinicio del lab o un
+# destroy no hace falta: deploy restaura solo el ultimo si la base esta vacia.
+on:
+  workflow_dispatch:
+    inputs:
+      respaldo:
+        description: "Respaldo a restaurar: mlflow-backup-AAAAMMDD-HHMMSS (hora UTC). Vacio = el mas reciente"
+        type: string
+        default: ""
+      confirmar:
+        description: 'Escribe "restaurar" para REEMPLAZAR la base actual (antes se respalda). Vacio = solo listar'
+        type: string
+        default: ""
+      cerrar_running:
+        description: "Marcar como KILLED las corridas que quedaron en RUNNING"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mlflow-infra
+  cancel-in-progress: false
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 140
+    steps:
+      - name: Entradas
+        id: cmd
+        env:
+          RESPALDO: ${{ inputs.respaldo }}
+          CONFIRM: ${{ inputs.confirmar }}
+          CLOSE: ${{ inputs.cerrar_running }}
+        run: |
+          RESPALDO=$(tr -d '[:space:]' <<<"$RESPALDO")
+          if ! [[ "$RESPALDO" =~ ^(mlflow-backup-[0-9]{8}-[0-9]{6})?$ ]]; then
+            echo "::error::Nombre de respaldo no valido: '${RESPALDO}'. Usa mlflow-backup-AAAAMMDD-HHMMSS o dejalo vacio."
+            exit 1
+          fi
+          cmd="bash /opt/mlflow/scripts/restore_mlflow.sh"
+          if [ -z "$CONFIRM" ]; then
+            cmd+=" --list"
+            echo "Sin confirmar: solo se listan los respaldos."
+          elif [ "$CONFIRM" = restaurar ]; then
+            cmd+=" --yes"
+            if [ "$CLOSE" = true ]; then cmd+=" --close-running"; fi
+            if [ -n "$RESPALDO" ]; then cmd+=" ${RESPALDO}"; fi
+          else
+            echo "::error::Escribe restaurar en la confirmacion (o dejala vacia para solo listar)."
+            exit 1
+          fi
+          echo "command=${cmd}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
+
+      - name: Stack
+        id: stack
+        uses: ./.github/actions/stack
+        with:
+          start: "true"
+
+      - name: Google Drive configurado
+        env:
+          INSTANCE_ID: ${{ steps.stack.outputs.instance_id }}
+          GDRIVE: ${{ steps.stack.outputs.gdrive_parameter }}
+        run: |
+          [ -n "$INSTANCE_ID" ] || { echo "::error::No hay ningun stack desplegado: lanza deploy (restaura solo si la base esta vacia)."; exit 1; }
+          [ -n "$GDRIVE" ] || { echo "::error::Google Drive no esta configurado: crea el secret GDRIVE_RCLONE_CONF (ver README) y lanza deploy."; exit 1; }
+
+      - name: Restore (SSM)
+        id: run
+        uses: ./.github/actions/ssm-run
+        with:
+          instance-id: ${{ steps.stack.outputs.instance_id }}
+          command: ${{ steps.cmd.outputs.command }}
+          comment: restore
+          timeout-minutes: 120
+
+      - name: Resumen
+        if: always() && steps.run.outputs.output != ''
+        env:
+          OUTPUT: ${{ steps.run.outputs.output }}
+        run: |
+          {
+            echo "### restore"
+            echo '```'
+            # Lista de respaldos, o el resumen y la verificacion de la restauracion.
+            sed -n -e '/^Respaldos en /,$p' -e '/^  Respaldo  /,/^  Destino/p' \
+              -e '/^Restauracion terminada/,$p' -e '/^ERROR/p' <<<"$OUTPUT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Volver a detener la EC2
+        if: always() && steps.stack.outputs.started == 'true'
+        env:
+          INSTANCE_ID: ${{ steps.stack.outputs.instance_id }}
+        run: |
+          aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null
+          echo "EC2 detenida de nuevo (estaba detenida antes del workflow)."
