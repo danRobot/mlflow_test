@@ -6,6 +6,7 @@ set -euo pipefail
 : "${MLFLOW_IMAGE:?}" "${MLFLOW_PUBLIC_HOST:?}" "${ARTIFACTS_BUCKET:?}" "${AWS_REGION:?}" "${POSTGRES_PARAMETER:?}"
 : "${SERVER_LOG_GROUP:?}" # accesos de MLflow en CloudWatch (driver awslogs del compose)
 LOG_GROUP="${LOG_GROUP:-}"
+AUTH_PARAMETER="${AUTH_PARAMETER:-}" # vacio: MLflow sin autenticacion
 COMPOSE_VERSION=v2.40.3
 export HOME="${HOME:-/root}" # SSM no siempre define HOME y docker lo necesita
 cd /opt/mlflow
@@ -35,6 +36,22 @@ umask 077
 POSTGRES_PASSWORD=$(aws ssm get-parameter --region "$AWS_REGION" --name "$POSTGRES_PARAMETER" \
     --with-decryption --query Parameter.Value --output text)
 rm -f secrets.env # clave aleatoria de versiones anteriores
+
+# Autenticacion de MLflow: con AUTH_PARAMETER (variable AUTH en S y los
+# secrets MLFLOW_USER y MLFLOW_AUTH_PASSWORD), "usuario:clave" va al archivo
+# que compose monta como secret; sin el, el archivo queda vacio. MLFLOW_AUTH
+# es una huella de las credenciales: si cambian, o se activa o desactiva la
+# autenticacion, compose recrea el contenedor de MLflow.
+if [ -n "$AUTH_PARAMETER" ]; then
+    MLFLOW_CREDENTIALS=$(aws ssm get-parameter --region "$AWS_REGION" --name "$AUTH_PARAMETER" \
+        --with-decryption --query Parameter.Value --output text)
+    printf '%s' "$MLFLOW_CREDENTIALS" >mlflow-auth
+    MLFLOW_AUTH="on-$(printf '%s' "$MLFLOW_CREDENTIALS" | sha256sum | cut -c1-16)"
+    unset MLFLOW_CREDENTIALS
+else
+    : >mlflow-auth
+    MLFLOW_AUTH=off
+fi
 {
     echo "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}"
     echo "MLFLOW_IMAGE=${MLFLOW_IMAGE}"
@@ -42,6 +59,7 @@ rm -f secrets.env # clave aleatoria de versiones anteriores
     echo "ARTIFACTS_DESTINATION=s3://${ARTIFACTS_BUCKET}/artifacts"
     echo "AWS_DEFAULT_REGION=${AWS_REGION}"
     echo "SERVER_LOG_GROUP=${SERVER_LOG_GROUP}"
+    echo "MLFLOW_AUTH=${MLFLOW_AUTH}"
 } >.env
 # Configuracion de los scripts de respaldo (infra/scripts).
 {

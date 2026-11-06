@@ -142,6 +142,17 @@ resource "aws_ssm_parameter" "postgres" {
   value_wo_version = parseint(substr(sha256(var.postgres_password), 0, 8), 16)
 }
 
+# Usuario y clave de MLflow ("usuario:clave"), solo con la autenticacion
+# activada: con AUTH en N se borra. Write-only como la de Postgres; deploy.sh
+# lo lee y el contenedor fija esa clave en cada arranque.
+resource "aws_ssm_parameter" "mlflow_auth" {
+  count            = var.mlflow_auth_enabled ? 1 : 0
+  name             = "/${var.project}/mlflow-auth"
+  type             = "SecureString"
+  value_wo         = var.mlflow_auth
+  value_wo_version = parseint(substr(sha256(var.mlflow_auth), 0, 8), 16)
+}
+
 # ---------------------------------------------------------------------------
 # Servidor. Sin user_data: Docker y el stack los instala deploy.sh por SSM,
 # asi cada deploy aplica los cambios sin recrear la instancia.

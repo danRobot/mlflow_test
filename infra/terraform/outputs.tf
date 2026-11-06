@@ -20,6 +20,11 @@ output "postgres_parameter" {
   value       = aws_ssm_parameter.postgres.name
 }
 
+output "auth_parameter" {
+  description = "Parametro SSM con usuario:clave de MLflow (vacio sin autenticacion)"
+  value       = try(aws_ssm_parameter.mlflow_auth[0].name, "")
+}
+
 output "log_group" {
   description = "Log group de CloudWatch con apagados y errores de memoria de la EC2"
   value       = aws_cloudwatch_log_group.ec2.name

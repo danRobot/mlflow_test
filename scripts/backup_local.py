@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     # La misma version que el servidor (infra/mlflow-server/Dockerfile).
-#     "mlflow-skinny==3.17.0",
+#     "mlflow-skinny==3.18.0",
 #     "tqdm==4.70.1",
 # ]
 # ///
@@ -28,7 +28,7 @@ Uso (la URL sale en el resumen del deploy):
   uv run scripts/backup_local.py --tracking-uri http://IP:8080
 
   o, sin uv:
-  pip install mlflow-skinny==3.17.0 tqdm==4.70.1
+  pip install mlflow-skinny==3.18.0 tqdm==4.70.1
   python scripts/backup_local.py --tracking-uri http://IP:8080
 
 Opciones:
@@ -275,9 +275,20 @@ def link_or_copy(src: str, dst: str) -> None:
 def check_server(tracking_uri: str) -> str:
     try:
         requests.get(f"{tracking_uri}/health", timeout=15).raise_for_status()
-        resp = requests.get(f"{tracking_uri}/version", timeout=15)
+        # Con autenticacion, /version (como toda la API) pide usuario y clave:
+        # las mismas variables de entorno que usa MLflow.
+        user = os.environ.get("MLFLOW_TRACKING_USERNAME")
+        auth = (user, os.environ.get("MLFLOW_TRACKING_PASSWORD", "")) if user else None
+        resp = requests.get(f"{tracking_uri}/version", auth=auth, timeout=15)
     except requests.RequestException as e:
         die(f"no se puede contactar {tracking_uri} ({e}). ¿Esta encendida la EC2 y es la IP correcta?")
+    if resp.status_code == 401:
+        die(
+            "usuario o clave incorrectos (MLFLOW_TRACKING_USERNAME y MLFLOW_TRACKING_PASSWORD)"
+            if user
+            else "el servidor pide usuario y clave: define MLFLOW_TRACKING_USERNAME y "
+            "MLFLOW_TRACKING_PASSWORD"
+        )
     server_version = resp.text.strip() if resp.ok else "desconocida"
     if server_version not in ("desconocida", mlflow.__version__):
         print(

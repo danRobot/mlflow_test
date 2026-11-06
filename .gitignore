@@ -4,3 +4,6 @@
 *.tfstate.*
 __pycache__/
 *.pyc
+
+# Usuario y clave de MLflow que escribe deploy.sh (nunca al repo)
+mlflow-auth

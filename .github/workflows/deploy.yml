@@ -28,12 +28,52 @@ jobs:
   config:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      auth: ${{ steps.auth.outputs.enabled }}
     steps:
       - name: Secret POSTGRES_PASSWORD
         run: |
           if [ -z "$TF_VAR_postgres_password" ]; then
             echo "::error::Falta el secret POSTGRES_PASSWORD (Settings > Secrets and variables > Actions)."
             exit 1
+          fi
+
+      # Con la variable AUTH en S y los dos secrets, MLflow pide usuario y
+      # clave. Con AUTH en N (o sin la variable o sin los secrets), no.
+      - name: Autenticacion de MLflow
+        id: auth
+        env:
+          AUTH: ${{ vars.AUTH }}
+          MLFLOW_USER: ${{ secrets.MLFLOW_USER }}
+          MLFLOW_AUTH_PASSWORD: ${{ secrets.MLFLOW_AUTH_PASSWORD }}
+        run: |
+          auth=$(tr -d '[:space:]' <<<"$AUTH" | tr '[:lower:]' '[:upper:]')
+          enabled=false
+          case "$auth" in
+            S)
+              if [ -z "$MLFLOW_USER" ] || [ -z "$MLFLOW_AUTH_PASSWORD" ]; then
+                echo "::warning::AUTH esta en S pero falta el secret MLFLOW_USER o MLFLOW_AUTH_PASSWORD: MLflow queda SIN autenticacion."
+              elif ! [[ "$MLFLOW_USER" =~ ^[A-Za-z0-9._@-]+$ ]]; then
+                echo "::error::MLFLOW_USER solo puede tener letras, numeros y . _ @ - (sin espacios ni ':')."
+                exit 1
+              elif [ "${#MLFLOW_AUTH_PASSWORD}" -lt 12 ] || [[ "$MLFLOW_AUTH_PASSWORD" == *$'\n'* ]]; then
+                echo "::error::MLFLOW_AUTH_PASSWORD debe tener al menos 12 caracteres (lo exige MLflow) y una sola linea."
+                exit 1
+              else
+                enabled=true
+              fi
+              ;;
+            N | "") ;;
+            *)
+              echo "::error::La variable AUTH debe ser S o N (es '$AUTH')."
+              exit 1
+              ;;
+          esac
+          echo "enabled=${enabled}" >> "$GITHUB_OUTPUT"
+          if [ "$enabled" = true ]; then
+            echo "MLflow con autenticacion (usuario del secret MLFLOW_USER)."
+          else
+            echo "MLflow sin autenticacion."
           fi
 
       - uses: actions/checkout@v7
@@ -66,10 +106,14 @@ jobs:
     needs: config
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      TF_VAR_mlflow_auth_enabled: ${{ needs.config.outputs.auth }}
+      TF_VAR_mlflow_auth: ${{ needs.config.outputs.auth == 'true' && format('{0}:{1}', secrets.MLFLOW_USER, secrets.MLFLOW_AUTH_PASSWORD) || '' }}
     outputs:
       instance_id: ${{ steps.apply.outputs.instance_id }}
       public_ip: ${{ steps.apply.outputs.public_ip }}
       postgres_parameter: ${{ steps.apply.outputs.postgres_parameter }}
+      auth_parameter: ${{ steps.apply.outputs.auth_parameter }}
       log_group: ${{ steps.apply.outputs.log_group }}
       server_log_group: ${{ steps.apply.outputs.server_log_group }}
     steps:
@@ -89,7 +133,7 @@ jobs:
             -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="region=${AWS_REGION}"
           terraform apply -input=false -auto-approve
-          for name in instance_id public_ip postgres_parameter log_group server_log_group; do
+          for name in instance_id public_ip postgres_parameter auth_parameter log_group server_log_group; do
             echo "${name}=$(terraform output -raw "$name")" >> "$GITHUB_OUTPUT"
           done
 
@@ -126,6 +170,7 @@ jobs:
       INSTANCE_ID: ${{ needs.terraform.outputs.instance_id }}
       PUBLIC_IP: ${{ needs.terraform.outputs.public_ip }}
       POSTGRES_PARAMETER: ${{ needs.terraform.outputs.postgres_parameter }}
+      AUTH_PARAMETER: ${{ needs.terraform.outputs.auth_parameter }}
       LOG_GROUP: ${{ needs.terraform.outputs.log_group }}
       SERVER_LOG_GROUP: ${{ needs.terraform.outputs.server_log_group }}
       IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
@@ -147,7 +192,7 @@ jobs:
           cmd+=" && MLFLOW_IMAGE=${ECR_REPOSITORY}:${IMAGE_TAG} MLFLOW_PUBLIC_HOST=${PUBLIC_IP}"
           cmd+=" ARTIFACTS_BUCKET=${ARTIFACTS_BUCKET} AWS_REGION=${AWS_REGION}"
           cmd+=" POSTGRES_PARAMETER=${POSTGRES_PARAMETER} LOG_GROUP=${LOG_GROUP}"
-          cmd+=" SERVER_LOG_GROUP=${SERVER_LOG_GROUP}"
+          cmd+=" SERVER_LOG_GROUP=${SERVER_LOG_GROUP} AUTH_PARAMETER=${AUTH_PARAMETER}"
           cmd+=" bash /opt/mlflow/deploy.sh"
           echo "command=${cmd}" >> "$GITHUB_OUTPUT"
 
@@ -163,6 +208,11 @@ jobs:
         run: |
           {
             echo "### MLflow: http://${PUBLIC_IP}:8080"
+            if [ -n "$AUTH_PARAMETER" ]; then
+              echo "Con autenticacion: usuario y clave de los secrets \`MLFLOW_USER\` y \`MLFLOW_AUTH_PASSWORD\`."
+            else
+              echo "Sin autenticacion (variable \`AUTH\` en N, o faltan los secrets)."
+            fi
             echo "Accesos por IP: CloudWatch > Logs Insights > Saved queries > \`mlflow/accesos-por-ip\`"
             echo "Respaldos: **Actions → backup**, en \`s3://${ARTIFACTS_BUCKET}/backup/\`."
           } >> "$GITHUB_STEP_SUMMARY"

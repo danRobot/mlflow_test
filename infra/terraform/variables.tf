@@ -45,3 +45,16 @@ variable "postgres_password" {
     error_message = "POSTGRES_PASSWORD: al menos 8 caracteres, solo letras, numeros y . _ ~ -"
   }
 }
+
+variable "mlflow_auth_enabled" {
+  description = "Autenticacion de MLflow. La decide el workflow de deploy: variable AUTH en S y los secrets MLFLOW_USER y MLFLOW_AUTH_PASSWORD."
+  type        = bool
+  default     = false
+}
+
+variable "mlflow_auth" {
+  description = "usuario:clave de MLflow (secrets MLFLOW_USER y MLFLOW_AUTH_PASSWORD). Solo se usa con mlflow_auth_enabled."
+  type        = string
+  default     = ""
+  sensitive   = true
+}

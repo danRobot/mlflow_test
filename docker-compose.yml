@@ -61,6 +61,11 @@ services:
       # Sin los procesos de jobs de GenAI (no se usan aqui): MLflow pasa de
       # ~1.9 GB a ~0.6 GB de RAM y cabe en una t3.small junto a Postgres.
       MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"
+      # Autenticacion: "off" o una huella del usuario y la clave (deploy.sh).
+      # Si cambia, compose recrea el contenedor y aplica la nueva.
+      MLFLOW_AUTH: ${MLFLOW_AUTH:-off}
+    secrets:
+      - mlflow_auth
     ports:
       - "8080:8080"
     # Salida a CloudWatch Logs (log group /mlflow/server): una linea por
@@ -91,3 +96,9 @@ volumes:
 networks:
   mlflow-net:
     name: mlflow-net
+
+# "usuario:clave" de MLflow, o vacio sin autenticacion. Lo escribe deploy.sh
+# (permisos 0600) y llega al contenedor en /run/secrets/mlflow_auth.
+secrets:
+  mlflow_auth:
+    file: ./mlflow-auth

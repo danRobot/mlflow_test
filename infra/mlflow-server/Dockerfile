@@ -22,9 +22,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
-# psycopg2-binary para PostgreSQL. boto3 para guardar los artefactos en S3.
+# [auth]: lo que pide la autenticacion de MLflow (Flask-WTF); sin activarla no
+# se usa. psycopg2-binary para PostgreSQL. boto3 para guardar los artefactos en S3.
 RUN uv pip install --system \
-        "mlflow==${MLFLOW_VERSION}" \
+        "mlflow[auth]==${MLFLOW_VERSION}" \
         "psycopg2-binary==2.9.13" \
         "boto3==1.43.124"
 

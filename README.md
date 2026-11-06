@@ -14,7 +14,8 @@ No hay bootstrap: el workflow de deploy crea con la AWS CLI los dos buckets (est
 En **Settings → Secrets and variables → Actions**:
 
 - **Secrets** `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` y `AWS_SESSION_TOKEN`: en el Learner Lab, **AWS Details → AWS CLI → Show**, copia cada valor.
-- **Secret** `POSTGRES_PASSWORD`: clave del usuario `mlflow` de Postgres (al menos 8 caracteres; solo letras, números y `. _ ~ -`, porque va dentro de la URL de conexión). Lo exige el deploy.
+- **Secret** `POSTGRES_PASSWORD`: clave del usuario `mlflow` de Postgres (al menos 8 caracteres; solo letras, números y `. _ ~ -`, porque va dentro de la URL de conexión). Lo exige el deploy. No sirve para entrar a MLflow.
+- **Opcional, para que MLflow pida usuario y clave**: la **variable** `AUTH` en `S` y los **secrets** `MLFLOW_USER` (letras, números y `. _ @ -`) y `MLFLOW_AUTH_PASSWORD` (12 caracteres o más, lo exige MLflow). Ver [Autenticación de MLflow](#autenticación-de-mlflow).
 - **Variable opcional** `AWS_REGION`: `us-east-1` (por defecto) o `us-west-2`, las únicas que permite el lab.
 
 ## 2. En cada sesión del lab
@@ -34,6 +35,27 @@ Las credenciales cambian cada vez que inicias el lab y caducan cuando termina la
 Si reinicias el lab sin hacer destroy, el reinicio puede borrar el estado de Terraform y dejar parámetros como `/mlflow/postgres-password`. Entonces deploy falla con `ParameterAlreadyExists`. Lanza destroy una vez: busca los parámetros por las etiquetas que pone Terraform (`Project=mlflow`, `ManagedBy=terraform`) y los borra aunque no haya estado. El siguiente deploy los vuelve a crear a partir de los secrets. Los parámetros sin esas etiquetas, que no son de este proyecto, no se tocan.
 
 Las dos etapas `config` fallan si las credenciales no sirven (caducadas, revocadas al reiniciar el lab o mal copiadas), en vez de seguir como si no hubiera nada desplegado.
+
+## Autenticación de MLflow
+
+Con la variable `AUTH` en `S` y los secrets `MLFLOW_USER` y `MLFLOW_AUTH_PASSWORD`, MLflow pide usuario y clave en la UI, en la API y al subir modelos. Con `AUTH` en `N`, sin la variable o sin alguno de los dos secrets, entra cualquiera. El cambio se aplica en el siguiente **deploy**, en los dos sentidos.
+
+- Ese usuario es el administrador. En cada deploy (y cada vez que arranca MLflow) se le pone la clave del secret, así que cambiar `MLFLOW_AUTH_PASSWORD` y lanzar deploy basta para cambiarla, también después de un restore. Si cambias `MLFLOW_USER`, el usuario anterior se borra.
+- Los usuarios viven en la misma base de Postgres, así que los respaldos los incluyen. Los que crees desde la UI (no administradores) se conservan; por defecto pueden ver todo, pero solo escribir en lo suyo o en lo que les des permiso.
+- Va por HTTP sin cifrar: la clave viaja legible en cada petición. Sirve para cerrar el servidor a terceros y escáneres, no contra alguien que espíe tu red.
+
+Desde un script, Colab o los scripts de respaldo local, el código no cambia: MLflow toma las credenciales de dos variables de entorno.
+
+```python
+import os
+os.environ["MLFLOW_TRACKING_USERNAME"] = "<MLFLOW_USER>"
+os.environ["MLFLOW_TRACKING_PASSWORD"] = "<MLFLOW_AUTH_PASSWORD>"  # en Colab, mejor desde sus Secrets
+
+import mlflow
+mlflow.set_tracking_uri("http://<IP>:8080")
+```
+
+Sin ellas, cualquier llamada falla con `401` ("You are not authenticated"). `/health` no pide clave, así que el healthcheck sigue funcionando.
 
 ## Respaldos en S3
 
@@ -86,7 +108,7 @@ Para consultarlos: CloudWatch → Logs Insights → **Saved queries**. Elige ant
 | `mlflow/accesos-por-hora` | Accesos e IPs distintas por hora; en la pestaña **Visualization** se ve como gráfica |
 | `mlflow/accesos-detalle` | Las últimas 1000 peticiones: hora, IP, método, ruta y código de respuesta |
 
-Las consultas ignoran las IPs privadas: el healthcheck de Docker (cada 30 s) y las peticiones desde la propia instancia. MLflow no pide clave, así que cualquier IP que no sea tuya ni de Colab es un tercero o un escáner de internet. Solo quedan registradas las peticiones HTTP: una conexión que no llega a enviar una petición válida no aparece.
+Las consultas ignoran las IPs privadas: el healthcheck de Docker (cada 30 s) y las peticiones desde la propia instancia. Sin autenticación, cualquier IP que no sea tuya ni de Colab es un tercero o un escáner de internet. Solo quedan registradas las peticiones HTTP: una conexión que no llega a enviar una petición válida no aparece.
 
 Destroy borra estos logs. Si quieres conservarlos, exporta antes los resultados desde Logs Insights (**Export results**).
 
@@ -105,7 +127,7 @@ No hay métricas, alarmas ni agente de CloudWatch, que sí tienen costo fijo. Cl
 
 Al terminar la sesión el lab detiene la EC2, pero la IP es fija (Elastic IP) y los datos se conservan. En la sesión siguiente, lanza deploy (o enciende la instancia desde la consola de EC2) y MLflow vuelve con la misma IP. La IP solo cambia después de un destroy o de un reset del lab.
 
-MLflow no pide usuario ni clave. La única clave es la de Postgres, que no se expone a internet (Postgres no publica puertos). Cada deploy aplica el valor actual del secret `POSTGRES_PASSWORD` a la base, aunque ya existiera con otra clave. Dentro de la instancia está en `/opt/mlflow/.env`, y en AWS en Parameter Store (`/mlflow/postgres-password`).
+La clave de Postgres no se expone a internet (Postgres no publica puertos) y es independiente de la de MLflow. Cada deploy aplica el valor actual del secret `POSTGRES_PASSWORD` a la base, aunque ya existiera con otra clave. Dentro de la instancia está en `/opt/mlflow/.env`, y en AWS en Parameter Store (`/mlflow/postgres-password`).
 
 Gasto aproximado del crédito del lab: unos US$0.03 por hora con la EC2 encendida si es t3.small (IP y disco incluidos; una m7i-flex.large ronda los US$0.10 por hora) y menos de US$0.01 por hora con ella detenida (la IP y el disco se siguen cobrando). Haz destroy cuando ya no lo necesites.
 
@@ -119,7 +141,7 @@ Para entrar a la instancia: `aws ssm start-session --target <instance_id>` (requ
 uv run scripts/backup_local.py --tracking-uri http://<IP>:8080
 ```
 
-`uv` instala solo las dependencias: `mlflow-skinny==3.17.0` (la misma versión que el servidor) y `tqdm` para las barras de progreso. Sin uv: `pip install mlflow-skinny==3.17.0 tqdm==4.70.1` y `python scripts/backup_local.py --tracking-uri http://<IP>:8080`.
+Con autenticación, exporta antes `MLFLOW_TRACKING_USERNAME` y `MLFLOW_TRACKING_PASSWORD`; sin ellas, el script lo avisa al empezar. `uv` instala solo las dependencias: `mlflow-skinny==3.18.0` (la misma versión que el servidor) y `tqdm` para las barras de progreso. Sin uv: `pip install mlflow-skinny==3.18.0 tqdm==4.70.1` y `python scripts/backup_local.py --tracking-uri http://<IP>:8080`.
 
 Mientras corre muestra dos barras: una de metadatos (corridas y modelos) y otra de artefactos con los MB descargados, la velocidad y el tiempo restante.
 
