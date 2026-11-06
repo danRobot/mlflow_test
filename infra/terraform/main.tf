@@ -142,19 +142,6 @@ resource "aws_ssm_parameter" "postgres" {
   value_wo_version = parseint(substr(sha256(var.postgres_password), 0, 8), 16)
 }
 
-# Acceso a Google Drive para los respaldos (secret GDRIVE_RCLONE_CONF): la
-# configuracion de rclone con el token. Igual que la clave de Postgres:
-# write-only y versionada por hash. Los scripts de infra/scripts lo leen en
-# cada respaldo. Sin el secret no se crea y no hay respaldos.
-resource "aws_ssm_parameter" "gdrive" {
-  count = nonsensitive(var.gdrive_rclone_conf != "") ? 1 : 0
-
-  name             = "/${var.project}/gdrive-rclone-conf"
-  type             = "SecureString"
-  value_wo         = var.gdrive_rclone_conf
-  value_wo_version = parseint(substr(sha256(var.gdrive_rclone_conf), 0, 8), 16)
-}
-
 # ---------------------------------------------------------------------------
 # Servidor. Sin user_data: Docker y el stack los instala deploy.sh por SSM,
 # asi cada deploy aplica los cambios sin recrear la instancia.

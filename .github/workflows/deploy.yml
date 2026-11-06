@@ -1,14 +1,8 @@
 name: deploy
 
 # Etapas: config -> terraform -> build (imagen en ECR) -> deploy (EC2 por SSM)
-#         -> restaurar (ultimo respaldo de Google Drive si la base esta vacia)
 on:
   workflow_dispatch:
-    inputs:
-      restaurar:
-        description: "Si la base de MLflow esta vacia (stack nuevo o lab reiniciado), restaurar el ultimo respaldo de Google Drive"
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -29,8 +23,6 @@ env:
   TF_IN_AUTOMATION: "true"
   TF_VAR_region: ${{ vars.AWS_REGION || 'us-east-1' }}
   TF_VAR_postgres_password: ${{ secrets.POSTGRES_PASSWORD }}
-  # Opcional: sin el, no hay respaldos en Google Drive (ver README).
-  TF_VAR_gdrive_rclone_conf: ${{ secrets.GDRIVE_RCLONE_CONF }}
 
 jobs:
   config:
@@ -42,24 +34,6 @@ jobs:
           if [ -z "$TF_VAR_postgres_password" ]; then
             echo "::error::Falta el secret POSTGRES_PASSWORD (Settings > Secrets and variables > Actions)."
             exit 1
-          fi
-
-      - name: Secret GDRIVE_RCLONE_CONF
-        run: |
-          if [ -z "$TF_VAR_gdrive_rclone_conf" ]; then
-            echo "::warning::Sin el secret GDRIVE_RCLONE_CONF no hay respaldos en Google Drive (ver README)."
-            exit 0
-          fi
-          # Es la salida de 'rclone config show': [nombre], type = drive y el token.
-          conf=$TF_VAR_gdrive_rclone_conf
-          if ! grep -qE '^\[.+\][[:space:]]*$' <<<"$conf" ||
-            ! grep -qE '^type[[:space:]]*=[[:space:]]*drive[[:space:]]*$' <<<"$conf" ||
-            ! grep -qE '^token[[:space:]]*=' <<<"$conf"; then
-            echo "::error::GDRIVE_RCLONE_CONF no es una configuracion de rclone para Google Drive: pega la salida completa de 'rclone config show' (ver README)."
-            exit 1
-          fi
-          if ! grep -qE '^client_id[[:space:]]*=[[:space:]]*[^[:space:]]' <<<"$conf"; then
-            echo "::warning::GDRIVE_RCLONE_CONF usa el client_id compartido de rclone, que Google retira en 2026. Crea el tuyo (ver README)."
           fi
 
       - uses: actions/checkout@v7
@@ -81,6 +55,13 @@ jobs:
           [ "$STATE_BUCKET_EXISTS" = true ] || create "$TF_STATE_BUCKET"
           [ "$ARTIFACTS_BUCKET_EXISTS" = true ] || create "$ARTIFACTS_BUCKET"
 
+      - name: Carpeta de respaldos
+        run: |
+          # Vacia, para subir a mano un .7z antes de restaurar. Si ya existe,
+          # sus respaldos no se tocan.
+          aws s3api put-object --bucket "$ARTIFACTS_BUCKET" --key backup/ >/dev/null
+          echo "Respaldos en s3://${ARTIFACTS_BUCKET}/backup/"
+
   terraform:
     needs: config
     runs-on: ubuntu-latest
@@ -91,7 +72,6 @@ jobs:
       postgres_parameter: ${{ steps.apply.outputs.postgres_parameter }}
       log_group: ${{ steps.apply.outputs.log_group }}
       server_log_group: ${{ steps.apply.outputs.server_log_group }}
-      gdrive_parameter: ${{ steps.apply.outputs.gdrive_parameter }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/aws-setup
@@ -109,7 +89,7 @@ jobs:
             -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="region=${AWS_REGION}"
           terraform apply -input=false -auto-approve
-          for name in instance_id public_ip postgres_parameter log_group server_log_group gdrive_parameter; do
+          for name in instance_id public_ip postgres_parameter log_group server_log_group; do
             echo "${name}=$(terraform output -raw "$name")" >> "$GITHUB_OUTPUT"
           done
 
@@ -148,7 +128,6 @@ jobs:
       POSTGRES_PARAMETER: ${{ needs.terraform.outputs.postgres_parameter }}
       LOG_GROUP: ${{ needs.terraform.outputs.log_group }}
       SERVER_LOG_GROUP: ${{ needs.terraform.outputs.server_log_group }}
-      GDRIVE_PARAMETER: ${{ needs.terraform.outputs.gdrive_parameter }}
       IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
     steps:
       - uses: actions/checkout@v7
@@ -161,14 +140,14 @@ jobs:
           for f in docker-compose.yml infra/deploy.sh infra/oom-alert.sh; do
             aws s3 cp "$f" "s3://${ARTIFACTS_BUCKET}/deploy/$(basename "$f")"
           done
-          aws s3 cp infra/scripts/ "s3://${ARTIFACTS_BUCKET}/deploy/scripts/" --recursive
+          aws s3 sync infra/scripts/ "s3://${ARTIFACTS_BUCKET}/deploy/scripts/" --delete
 
           cmd="mkdir -p /opt/mlflow"
           cmd+=" && aws s3 cp s3://${ARTIFACTS_BUCKET}/deploy/ /opt/mlflow/ --recursive --quiet"
           cmd+=" && MLFLOW_IMAGE=${ECR_REPOSITORY}:${IMAGE_TAG} MLFLOW_PUBLIC_HOST=${PUBLIC_IP}"
           cmd+=" ARTIFACTS_BUCKET=${ARTIFACTS_BUCKET} AWS_REGION=${AWS_REGION}"
           cmd+=" POSTGRES_PARAMETER=${POSTGRES_PARAMETER} LOG_GROUP=${LOG_GROUP}"
-          cmd+=" SERVER_LOG_GROUP=${SERVER_LOG_GROUP} GDRIVE_PARAMETER=${GDRIVE_PARAMETER}"
+          cmd+=" SERVER_LOG_GROUP=${SERVER_LOG_GROUP}"
           cmd+=" bash /opt/mlflow/deploy.sh"
           echo "command=${cmd}" >> "$GITHUB_OUTPUT"
 
@@ -185,42 +164,6 @@ jobs:
           {
             echo "### MLflow: http://${PUBLIC_IP}:8080"
             echo "Accesos por IP: CloudWatch > Logs Insights > Saved queries > \`mlflow/accesos-por-ip\`"
-            echo ""
-            if [ -n "$GDRIVE_PARAMETER" ]; then
-              echo "Respaldos en Google Drive: activados (cada hora y al apagar la EC2)."
-            else
-              echo "Respaldos en Google Drive: **desactivados** (falta el secret \`GDRIVE_RCLONE_CONF\`, ver README)."
-            fi
+            echo "Respaldos: **Actions → backup**, en \`s3://${ARTIFACTS_BUCKET}/backup/\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Tras un reinicio del lab o un destroy, el stack nace vacio: se trae el
-  # ultimo respaldo de Drive. Si la base ya tiene datos, no hace nada.
-  restaurar:
-    needs: [terraform, deploy]
-    if: inputs.restaurar && needs.terraform.outputs.gdrive_parameter != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 125
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/aws-setup
-
-      - name: Restaurar si la base esta vacia (SSM)
-        id: restore
-        uses: ./.github/actions/ssm-run
-        with:
-          instance-id: ${{ needs.terraform.outputs.instance_id }}
-          command: bash /opt/mlflow/scripts/restore_mlflow.sh --if-empty --yes
-          comment: restaurar si la base esta vacia
-          timeout-minutes: 120
-
-      - name: Resumen
-        env:
-          OUTPUT: ${{ steps.restore.outputs.output }}
-        run: |
-          restored=$(sed -n 's/^RESTAURADO=//p' <<<"$OUTPUT")
-          if [ -n "$restored" ]; then
-            msg="Restaurado de Google Drive: \`${restored}\`."
-          else
-            msg=$(grep -E 'ya tiene datos|No hay respaldos' <<<"$OUTPUT" || echo "Sin restauracion.")
-          fi
-          echo "$msg" >> "$GITHUB_STEP_SUMMARY"

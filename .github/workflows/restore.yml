@@ -1,23 +1,17 @@
 name: restore
 
-# Restaura en la EC2 un respaldo de Google Drive. Sin confirmar, solo lista
-# los respaldos (en el resumen del run). Despues de un reinicio del lab o un
-# destroy no hace falta: deploy restaura solo el ultimo si la base esta vacia.
+# Restaura el respaldo mas reciente de s3://<bucket>/backup/ (por el nombre,
+# backup_mlflow_AAAAMMDD-HHMMSS.7z) y, si sale bien, borra ese .7z de S3.
+# REEMPLAZA la base actual de MLflow. Si la carpeta no tiene ningun .7z,
+# falla: en una instalacion limpia (despues de un destroy o un reinicio del
+# lab) sube antes el .7z a mano desde la consola de S3, carpeta backup/.
 on:
   workflow_dispatch:
     inputs:
-      respaldo:
-        description: "Respaldo a restaurar: mlflow-backup-AAAAMMDD-HHMMSS (hora UTC). Vacio = el mas reciente"
-        type: string
-        default: ""
       confirmar:
-        description: 'Escribe "restaurar" para REEMPLAZAR la base actual (antes se respalda). Vacio = solo listar'
+        description: 'Escribe "restaurar" para REEMPLAZAR la base actual por el ultimo respaldo de la carpeta backup/ de S3'
+        required: true
         type: string
-        default: ""
-      cerrar_running:
-        description: "Marcar como KILLED las corridas que quedaron en RUNNING"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -40,31 +34,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 140
     steps:
-      - name: Entradas
-        id: cmd
+      - name: Confirmacion
         env:
-          RESPALDO: ${{ inputs.respaldo }}
           CONFIRM: ${{ inputs.confirmar }}
-          CLOSE: ${{ inputs.cerrar_running }}
         run: |
-          RESPALDO=$(tr -d '[:space:]' <<<"$RESPALDO")
-          if ! [[ "$RESPALDO" =~ ^(mlflow-backup-[0-9]{8}-[0-9]{6})?$ ]]; then
-            echo "::error::Nombre de respaldo no valido: '${RESPALDO}'. Usa mlflow-backup-AAAAMMDD-HHMMSS o dejalo vacio."
+          if [ "$CONFIRM" != restaurar ]; then
+            echo "::error::Escribe restaurar en la confirmacion para reemplazar la base actual."
             exit 1
           fi
-          cmd="bash /opt/mlflow/scripts/restore_mlflow.sh"
-          if [ -z "$CONFIRM" ]; then
-            cmd+=" --list"
-            echo "Sin confirmar: solo se listan los respaldos."
-          elif [ "$CONFIRM" = restaurar ]; then
-            cmd+=" --yes"
-            if [ "$CLOSE" = true ]; then cmd+=" --close-running"; fi
-            if [ -n "$RESPALDO" ]; then cmd+=" ${RESPALDO}"; fi
-          else
-            echo "::error::Escribe restaurar en la confirmacion (o dejala vacia para solo listar)."
-            exit 1
-          fi
-          echo "command=${cmd}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
       - uses: ./.github/actions/aws-setup
@@ -75,21 +52,19 @@ jobs:
         with:
           start: "true"
 
-      - name: Google Drive configurado
+      - name: Hay stack
         env:
           INSTANCE_ID: ${{ steps.stack.outputs.instance_id }}
-          GDRIVE: ${{ steps.stack.outputs.gdrive_parameter }}
         run: |
-          [ -n "$INSTANCE_ID" ] || { echo "::error::No hay ningun stack desplegado: lanza deploy (restaura solo si la base esta vacia)."; exit 1; }
-          [ -n "$GDRIVE" ] || { echo "::error::Google Drive no esta configurado: crea el secret GDRIVE_RCLONE_CONF (ver README) y lanza deploy."; exit 1; }
+          [ -n "$INSTANCE_ID" ] || { echo "::error::No hay ningun stack desplegado: lanza deploy y despues restore."; exit 1; }
 
-      - name: Restore (SSM)
+      - name: Restore desde S3 (SSM)
         id: run
         uses: ./.github/actions/ssm-run
         with:
           instance-id: ${{ steps.stack.outputs.instance_id }}
-          command: ${{ steps.cmd.outputs.command }}
-          comment: restore
+          command: bash /opt/mlflow/scripts/restore_mlflow.sh --yes
+          comment: restore desde S3
           timeout-minutes: 120
 
       - name: Resumen
@@ -100,9 +75,9 @@ jobs:
           {
             echo "### restore"
             echo '```'
-            # Lista de respaldos, o el resumen y la verificacion de la restauracion.
-            sed -n -e '/^Respaldos en /,$p' -e '/^  Respaldo  /,/^  Destino/p' \
-              -e '/^Restauracion terminada/,$p' -e '/^ERROR/p' <<<"$OUTPUT"
+            # El resumen del respaldo elegido y el resultado (o el error).
+            sed -n -e '/^  Respaldo  /,/^  MLflow/p' -e '/^Restauracion terminada/,/^  artefactos/p' \
+              -e '/^ERROR/p' <<<"$OUTPUT"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

@@ -1,7 +1,7 @@
 name: stack
 description: >-
-  Lee del estado de Terraform la instancia y el parametro de Google Drive.
-  Con start "true", enciende la EC2 si la sesion anterior del lab la detuvo.
+  Lee del estado de Terraform la instancia. Con start "true", enciende la
+  EC2 si la sesion anterior del lab la detuvo.
   Necesita aws-setup antes (bucket del estado).
 
 inputs:
@@ -14,9 +14,6 @@ outputs:
   instance_id:
     description: ID de la EC2 (vacio si no hay stack)
     value: ${{ steps.info.outputs.instance_id }}
-  gdrive_parameter:
-    description: Parametro SSM de Google Drive (vacio si no esta configurado)
-    value: ${{ steps.info.outputs.gdrive_parameter }}
   started:
     description: '"true" si esta accion encendio la EC2'
     value: ${{ steps.info.outputs.started }}
@@ -29,7 +26,7 @@ runs:
         terraform_version: 1.16.7
         terraform_wrapper: false # el wrapper ensucia la salida de `terraform output`
 
-    - name: Instancia y Google Drive (estado de Terraform)
+    - name: Instancia (estado de Terraform)
       id: info
       shell: bash
       working-directory: infra/terraform
@@ -37,13 +34,12 @@ runs:
         START: ${{ inputs.start }}
       run: |
         set -euo pipefail
-        id="" gdrive="" started=false
+        id="" started=false
         if [ "$STATE_BUCKET_EXISTS" = true ]; then
           terraform init -input=false \
             -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="region=${AWS_REGION}" >/dev/null
           id=$(terraform output -raw instance_id 2>/dev/null || true)
-          gdrive=$(terraform output -raw gdrive_parameter 2>/dev/null || true)
         fi
 
         if [ -z "$id" ]; then
@@ -70,6 +66,5 @@ runs:
         fi
         {
           echo "instance_id=${id}"
-          echo "gdrive_parameter=${gdrive}"
           echo "started=${started}"
         } >> "$GITHUB_OUTPUT"
