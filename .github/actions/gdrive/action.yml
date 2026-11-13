@@ -1,0 +1,42 @@
+name: Google Drive
+description: >
+  Lleva los respaldos entre la carpeta backup/ del bucket y la carpeta de
+  Google Drive (gdrive.py). Necesita en el entorno GDRIVE_CREDENTIALS,
+  GDRIVE_FOLDER_ID, ARTIFACTS_BUCKET (lo pone aws-setup) y las credenciales
+  de AWS del workflow.
+
+inputs:
+  command:
+    description: "check (credenciales y carpeta), upload (backup/ de S3 -> Drive) o fetch (el mas reciente de Drive -> backup/ de S3)"
+    required: true
+
+outputs:
+  name:
+    description: Nombre del respaldo subido (upload) o copiado a S3 (fetch)
+    value: ${{ steps.run.outputs.name }}
+  size:
+    description: Tamano del respaldo
+    value: ${{ steps.run.outputs.size }}
+  link:
+    description: Enlace al respaldo en Google Drive
+    value: ${{ steps.run.outputs.link }}
+
+runs:
+  using: composite
+  steps:
+    - name: Dependencias (una vez por job)
+      shell: bash
+      run: |
+        if [ ! -x "$RUNNER_TEMP/gdrive/bin/python" ]; then
+          python3 -m venv "$RUNNER_TEMP/gdrive"
+          "$RUNNER_TEMP/gdrive/bin/pip" install --quiet --disable-pip-version-check \
+            -r "$GITHUB_ACTION_PATH/requirements.txt"
+        fi
+
+    - id: run
+      name: gdrive ${{ inputs.command }}
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+      run: |
+        "$RUNNER_TEMP/gdrive/bin/python" "$GITHUB_ACTION_PATH/gdrive.py" "$COMMAND"

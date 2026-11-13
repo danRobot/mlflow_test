@@ -22,7 +22,7 @@ if ! docker compose version >/dev/null 2>&1; then
         "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64"
     chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 fi
-# Para los respaldos en S3 (scripts/): 7z comprime y mount-s3 monta el bucket
+# Para los respaldos (scripts/): 7z comprime y mount-s3 monta el bucket
 # mientras dura un respaldo o una restauracion. Los dos estan en los
 # repositorios de Amazon Linux 2023; si la AMI es anterior a esos paquetes,
 # se toman de la ultima version de los repositorios.
@@ -104,8 +104,9 @@ EOF
     systemctl restart mlflow-oom-alert
 fi
 
-# 5) Los respaldos automaticos en Google Drive de versiones anteriores (cada
-#    hora y al apagar) ya no existen: se respalda con el workflow backup.
+# 5) Los respaldos automaticos de versiones anteriores (desde la EC2, cada
+#    hora y al apagar) ya no existen: ahora el workflow backup sube el .7z a
+#    Google Drive.
 #    Parar el de apagado lanza el script nuevo con --shutdown, que solo falla.
 removed=no
 for unit in mlflow-backup.timer mlflow-backup.service mlflow-backup-shutdown.service; do

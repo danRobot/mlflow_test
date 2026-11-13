@@ -1,9 +1,10 @@
 name: backup
 
-# Respaldo de MLflow en S3: la base y los artefactos en un solo .7z, en
-# s3://<bucket>/backup/backup_mlflow_AAAAMMDD-HHMMSS.7z (hora UTC). Destroy
-# borra esa carpeta: para conservar el respaldo, descargalo desde la consola
-# de S3. Si la EC2 esta detenida, la enciende y al terminar la detiene.
+# Respaldo de MLflow en Google Drive. La EC2 junta la base y los artefactos en
+# un solo .7z, s3://<bucket>/backup/backup_mlflow_AAAAMMDD-HHMMSS.7z (hora
+# UTC); despues el runner lo sube a la carpeta de Drive del secret
+# GDRIVE_FOLDER_ID, comprueba el MD5 y lo borra de S3: backup/ es solo de
+# paso. Si la EC2 esta detenida, la enciende y al terminar la detiene.
 on:
   workflow_dispatch:
 
@@ -27,10 +28,19 @@ env:
 jobs:
   backup:
     runs-on: ubuntu-latest
-    timeout-minutes: 170
+    timeout-minutes: 230
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/aws-setup
+
+      # Antes de encender nada: que las credenciales y la carpeta de Drive sirvan.
+      - name: Google Drive
+        uses: ./.github/actions/gdrive
+        with:
+          command: check
+        env:
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
 
       - name: Stack
         id: stack
@@ -51,22 +61,10 @@ jobs:
         with:
           instance-id: ${{ steps.stack.outputs.instance_id }}
           command: bash /opt/mlflow/scripts/backup_mlflow.sh
-          comment: respaldo en S3
+          comment: respaldo de MLflow
           timeout-minutes: 150
 
-      - name: Resumen
-        if: always() && steps.run.outputs.output != ''
-        env:
-          OUTPUT: ${{ steps.run.outputs.output }}
-        run: |
-          {
-            echo "### Respaldo de MLflow"
-            echo '```'
-            grep -E '^(Respaldo completo|  experimentos=|La base esta vacia|ERROR|Respaldo FALLIDO)' <<<"$OUTPUT" || true
-            echo '```'
-            echo "Para conservarlo despues de un destroy o un reinicio del lab, descargalo desde la consola de S3: bucket \`${ARTIFACTS_BUCKET}\`, carpeta \`backup/\`."
-          } >> "$GITHUB_STEP_SUMMARY"
-
+      # Antes de subir a Drive, que no necesita la EC2.
       - name: Volver a detener la EC2
         if: always() && steps.stack.outputs.started == 'true'
         env:
@@ -75,3 +73,38 @@ jobs:
           # Estaba detenida antes del workflow: se deja igual.
           aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null
           echo "EC2 detenida de nuevo."
+
+      # Sube cada .7z de backup/ (tambien el que haya dejado ahi una subida
+      # anterior que fallo), comprueba el MD5 y lo borra de S3.
+      - name: Subir a Google Drive
+        id: drive
+        if: "!cancelled() && steps.run.outcome == 'success'"
+        timeout-minutes: 60
+        uses: ./.github/actions/gdrive
+        with:
+          command: upload
+        env:
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+
+      - name: Resumen
+        if: always() && steps.run.outputs.output != ''
+        env:
+          OUTPUT: ${{ steps.run.outputs.output }}
+          DRIVE: ${{ steps.drive.outcome }}
+          NAME: ${{ steps.drive.outputs.name }}
+          SIZE: ${{ steps.drive.outputs.size }}
+          LINK: ${{ steps.drive.outputs.link }}
+        run: |
+          {
+            echo "### Respaldo de MLflow"
+            echo '```'
+            grep -E '^(Respaldo completo|  experimentos=|La base esta vacia|ERROR|Respaldo FALLIDO)' <<<"$OUTPUT" || true
+            echo '```'
+            if [ "$DRIVE" = success ] && [ -n "$NAME" ]; then
+              echo "En Google Drive: [${NAME}](${LINK}) (${SIZE}). Ya no esta en S3."
+            elif [ "$DRIVE" = failure ]; then
+              echo "**No se pudo subir a Google Drive** (el error esta en el paso *Subir a Google Drive*)."
+              echo "El .7z sigue en \`s3://${ARTIFACTS_BUCKET}/backup/\` (un destroy lo borraria): el proximo backup lo vuelve a intentar."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

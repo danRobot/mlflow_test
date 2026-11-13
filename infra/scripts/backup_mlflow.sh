@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# backup_mlflow.sh - Respaldo de MLflow en S3: la base (PostgreSQL) y los
-# artefactos en un solo .7z con la maxima compresion. Corre en la EC2, como
-# root; lo lanza el workflow backup por SSM.
+# backup_mlflow.sh - Respaldo de MLflow: la base (PostgreSQL) y los
+# artefactos en un solo .7z con la maxima compresion, en la carpeta backup/
+# del bucket. Corre en la EC2, como root; lo lanza el workflow backup por SSM,
+# que despues sube el .7z a Google Drive y lo borra de S3.
 #
 # Uso (busca el docker-compose.yml subiendo desde la carpeta del script; o
 # fijalo con COMPOSE_DIR=/ruta):
@@ -186,5 +187,5 @@ WORK=""
 echo ""
 echo "Respaldo completo: s3://${BUCKET}/backup/${NAME}.7z ($(mb "${ARCHIVE_BYTES}"))"
 echo "  experimentos=${EXPERIMENTS} corridas=${RUNS} artefactos=${ART_FILES} archivos ($(mb "${ART_BYTES}") sin comprimir) mlflow=${MLFLOW_VERSION}"
-echo "Para conservarlo despues de un destroy o un reinicio del lab, descargalo desde la consola de S3 (carpeta backup/)."
+echo "backup/ es solo de paso: el workflow backup lo sube ahora a Google Drive y lo borra de S3."
 echo "RESPALDO=${NAME}.7z"

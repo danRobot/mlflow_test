@@ -1,15 +1,16 @@
 name: restore
 
-# Restaura el respaldo mas reciente de s3://<bucket>/backup/ (por el nombre,
-# backup_mlflow_AAAAMMDD-HHMMSS.7z) y, si sale bien, borra ese .7z de S3.
-# REEMPLAZA la base actual de MLflow. Si la carpeta no tiene ningun .7z,
-# falla: en una instalacion limpia (despues de un destroy o un reinicio del
-# lab) sube antes el .7z a mano desde la consola de S3, carpeta backup/.
+# Restaura el respaldo mas reciente de la carpeta de Google Drive del secret
+# GDRIVE_FOLDER_ID (por el nombre, backup_mlflow_AAAAMMDD-HHMMSS.7z). El
+# runner lo copia a s3://<bucket>/backup/ comprobando el MD5, la EC2 lo
+# restaura y la copia de S3 se borra al terminar, salga bien o mal. En Drive
+# no se borra nada. REEMPLAZA la base actual de MLflow. Si la carpeta de Drive
+# no tiene ningun .7z, falla antes de tocar nada.
 on:
   workflow_dispatch:
     inputs:
       confirmar:
-        description: 'Escribe "restaurar" para REEMPLAZAR la base actual por el ultimo respaldo de la carpeta backup/ de S3'
+        description: 'Escribe "restaurar" para REEMPLAZAR la base actual por el respaldo mas reciente de Google Drive'
         required: true
         type: string
 
@@ -32,7 +33,7 @@ env:
 jobs:
   restore:
     runs-on: ubuntu-latest
-    timeout-minutes: 140
+    timeout-minutes: 200
     steps:
       - name: Confirmacion
         env:
@@ -46,6 +47,22 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/aws-setup
 
+      - name: Hay bucket
+        run: |
+          [ "$ARTIFACTS_BUCKET_EXISTS" = true ] || { echo "::error::No hay ningun stack desplegado: lanza deploy y despues restore."; exit 1; }
+
+      # Antes de encender la EC2: si la carpeta de Drive no tiene respaldos o
+      # las credenciales no sirven, falla aqui.
+      - name: Copiar de Google Drive a S3
+        id: drive
+        timeout-minutes: 60
+        uses: ./.github/actions/gdrive
+        with:
+          command: fetch
+        env:
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+
       - name: Stack
         id: stack
         uses: ./.github/actions/stack
@@ -58,27 +75,42 @@ jobs:
         run: |
           [ -n "$INSTANCE_ID" ] || { echo "::error::No hay ningun stack desplegado: lanza deploy y despues restore."; exit 1; }
 
-      - name: Restore desde S3 (SSM)
+      # El nombre viene filtrado por gdrive.py (backup_mlflow_[A-Za-z0-9._-]+.7z).
+      - name: Restore (SSM)
         id: run
         uses: ./.github/actions/ssm-run
         with:
           instance-id: ${{ steps.stack.outputs.instance_id }}
-          command: bash /opt/mlflow/scripts/restore_mlflow.sh --yes
-          comment: restore desde S3
+          command: bash /opt/mlflow/scripts/restore_mlflow.sh --yes --file ${{ steps.drive.outputs.name }}
+          comment: restore desde Google Drive
           timeout-minutes: 120
 
+      # Si salio bien ya la borro restore_mlflow.sh. El original sigue en Drive.
+      - name: Borrar la copia de S3
+        if: always() && steps.drive.outputs.name != ''
+        env:
+          NAME: ${{ steps.drive.outputs.name }}
+        run: |
+          aws s3 rm "s3://${ARTIFACTS_BUCKET}/backup/${NAME}" --only-show-errors
+
       - name: Resumen
-        if: always() && steps.run.outputs.output != ''
+        if: always() && steps.drive.outputs.name != ''
         env:
           OUTPUT: ${{ steps.run.outputs.output }}
+          NAME: ${{ steps.drive.outputs.name }}
+          SIZE: ${{ steps.drive.outputs.size }}
+          LINK: ${{ steps.drive.outputs.link }}
         run: |
           {
             echo "### restore"
-            echo '```'
-            # El resumen del respaldo elegido y el resultado (o el error).
-            sed -n -e '/^  Respaldo  /,/^  MLflow/p' -e '/^Restauracion terminada/,/^  artefactos/p' \
-              -e '/^ERROR/p' <<<"$OUTPUT"
-            echo '```'
+            echo "Respaldo de Google Drive: [${NAME}](${LINK}) (${SIZE}). En Drive no se borro nada."
+            if [ -n "$OUTPUT" ]; then
+              echo '```'
+              # El resumen del respaldo y el resultado (o el error).
+              sed -n -e '/^  Respaldo  /,/^  MLflow/p' -e '/^Restauracion terminada/,/^  artefactos/p' \
+                -e '/^ERROR/p' <<<"$OUTPUT"
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Volver a detener la EC2

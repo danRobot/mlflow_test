@@ -97,10 +97,11 @@ jobs:
 
       - name: Carpeta de respaldos
         run: |
-          # Vacia, para subir a mano un .7z antes de restaurar. Si ya existe,
-          # sus respaldos no se tocan.
+          # De paso: backup deja aqui el .7z antes de subirlo a Google Drive y
+          # restore trae aqui el de Drive antes de restaurarlo. Si ya existe,
+          # lo que tenga no se toca.
           aws s3api put-object --bucket "$ARTIFACTS_BUCKET" --key backup/ >/dev/null
-          echo "Respaldos en s3://${ARTIFACTS_BUCKET}/backup/"
+          echo "Carpeta de paso de los respaldos: s3://${ARTIFACTS_BUCKET}/backup/"
 
   terraform:
     needs: config
@@ -214,6 +215,6 @@ jobs:
               echo "Sin autenticacion (variable \`AUTH\` en N, o faltan los secrets)."
             fi
             echo "Accesos por IP: CloudWatch > Logs Insights > Saved queries > \`mlflow/accesos-por-ip\`"
-            echo "Respaldos: **Actions → backup**, en \`s3://${ARTIFACTS_BUCKET}/backup/\`."
+            echo "Respaldos: **Actions → backup** los guarda en Google Drive; **Actions → restore** recupera el mas reciente."
           } >> "$GITHUB_STEP_SUMMARY"
 

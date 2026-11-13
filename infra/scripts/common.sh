@@ -62,7 +62,8 @@ take_lock() {
 }
 
 # Bucket de MLflow, a partir de ARTIFACTS_DESTINATION (s3://<bucket>/artifacts).
-# Los respaldos van en la carpeta backup/ del mismo bucket.
+# Los respaldos pasan por la carpeta backup/ del mismo bucket (de paso hacia o
+# desde Google Drive, en los workflows backup y restore).
 BUCKET=""
 setup_s3() {
     command -v aws >/dev/null || die "falta la AWS CLI"
