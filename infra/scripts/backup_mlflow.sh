@@ -127,10 +127,10 @@ read -r ART_FILES ART_BYTES <<<"${SUMMARY}"
 # para no dejar sin disco a Postgres y MLflow.
 need_space "${WORK_BASE}" $((ART_BYTES + DB_BYTES + 536870912)) "armar el .7z"
 
-# 7-Zip con la maxima compresion (-mx=9). En 7-Zip 2x usa un diccionario de
+# 7-Zip con la minima compresion (-mx=1). En 7-Zip 2x usa un diccionario de
 # 256 MB y unos 2.2 GB de RAM; si no hay tanta memoria libre (t3.small), se
 # baja a 64 MB: unos 0.7 GB y un .7z practicamente igual.
-SZ_OPTS=(-t7z -mx=9 -bd)
+SZ_OPTS=(-t7z -mx=1 -bd)
 if [ "$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)" -lt $((3 * 1024 * 1024)) ]; then
     SZ_OPTS+=(-md=64m)
 fi

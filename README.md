@@ -91,7 +91,7 @@ Los dos workflows revisan las credenciales y la carpeta antes de encender la EC2
 
 ### Respaldar
 
-**Actions → backup → Run workflow**. La EC2 arma `backup_mlflow_AAAAMMDD-HHMMSS.7z` (fecha y hora UTC) en `s3://<bucket>/backup/`, comprimido con 7-Zip al máximo (`-mx=9`), con:
+**Actions → backup → Run workflow**. La EC2 arma `backup_mlflow_AAAAMMDD-HHMMSS.7z` (fecha y hora UTC) en `s3://<bucket>/backup/`, comprimido con 7-Zip al mínimo (`-mx=1`), con:
 
 ```
 db.sql          la base completa (pg_dump)
