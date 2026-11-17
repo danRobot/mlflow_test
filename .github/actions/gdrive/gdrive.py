@@ -2,8 +2,11 @@
 """Lleva los respaldos de MLflow entre la carpeta backup/ del bucket y Google Drive.
 
 Corre en el runner de GitHub Actions (action gdrive), no en la EC2. Los datos
-van de S3 a Drive y de Drive a S3 por partes de 32 MB: nada pasa por el disco
-del runner. Cada copia se comprueba con el MD5 que calcula Drive.
+pasan por la memoria del runner, nunca por su disco. A Drive suben por un solo
+flujo (Drive no admite mas para un archivo), en trozos de 128 MB, mientras el
+siguiente trozo ya se lee de S3 por varias conexiones. De Drive a S3 bajan por
+varias conexiones a la vez. Cada copia se comprueba con el MD5 que calcula
+Drive, y cada 15 s sale una linea con lo copiado, la velocidad y lo que falta.
 
   check    comprueba las credenciales y la carpeta de Drive
   upload   sube a Drive cada backup/backup_mlflow_*.7z del bucket y, ya
@@ -28,13 +31,19 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import boto3
 import google.auth
 import google.auth.exceptions
 import requests
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 from google.auth.transport.requests import AuthorizedSession, Request
+from requests.adapters import HTTPAdapter
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 API = os.environ.get("GDRIVE_API_ROOT", "https://www.googleapis.com").rstrip("/")
@@ -43,10 +52,15 @@ SEVENZ_MIME = "application/x-7z-compressed"
 FILE_FIELDS = "id,name,size,md5Checksum,createdTime,webViewLink"
 NAME_RE = re.compile(r"^backup_mlflow_[A-Za-z0-9._-]+\.7z$")
 PREFIX = "backup/"
-CHUNK = 32 * 1024 * 1024  # Drive pide multiplos de 256 KiB
+CHUNK = 128 * 1024 * 1024  # cada PUT a Drive (multiplo de 256 KiB): mas grande, menos pausas
+PART = 32 * 1024 * 1024  # lo que lee o escribe cada conexion
+WORKERS = 8  # conexiones a la vez con S3 o con Drive
+PROGRESS_EVERY = 15  # segundos entre lineas de avance
 RETRIES = 8
 RETRY_STATUS = {408, 429, 500, 502, 503, 504}
 RATE_REASONS = {"rateLimitExceeded", "userRateLimitExceeded", "backendError"}
+# Fallos de red, tambien al renovar el token: se reintentan.
+NET_ERRORS = (requests.RequestException, google.auth.exceptions.TransportError)
 
 
 class Fail(Exception):
@@ -63,6 +77,58 @@ class SessionLost(Exception):
 
 def mb(n: int) -> str:
     return f"{n / 1073741824:.1f} GB" if n >= 1073741824 else f"{n / 1048576:.1f} MB"
+
+
+def hms(seconds: float) -> str:
+    s = round(seconds)
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        return f"{s // 60} min {s % 60:02d} s"
+    return f"{s // 3600} h {s % 3600 // 60:02d} min"
+
+
+class Progress:
+    """Avance de una copia: cada PROGRESS_EVERY s, lo copiado, la velocidad
+    media y lo que falta a esa velocidad."""
+
+    def __init__(self, total: int) -> None:
+        self.total = total
+        self.start = self.last = time.monotonic()
+
+    def __call__(self, done: int) -> None:
+        now = time.monotonic()
+        if done >= self.total or now - self.last < PROGRESS_EVERY:
+            return
+        self.last = now
+        speed = done / max(now - self.start, 0.001)
+        left = f", faltan {hms((self.total - done) / speed)}" if speed else ""
+        print(
+            f"  {mb(done)} de {mb(self.total)} ({100 * done // self.total}%), {speed / 1048576:.1f} MB/s{left}"
+        )
+
+    def summary(self) -> str:
+        took = max(time.monotonic() - self.start, 0.001)
+        return f"en {hms(took)} ({self.total / 1048576 / took:.1f} MB/s)"
+
+
+class Hasher:
+    """MD5 en orden, en su propio hilo: no frena la subida (hashlib suelta el
+    GIL con trozos grandes)."""
+
+    def __init__(self) -> None:
+        self.md5 = hashlib.md5()
+        self.pool = ThreadPoolExecutor(1)
+
+    def update(self, data: bytes | memoryview) -> None:
+        self.pool.submit(self.md5.update, data)
+
+    def hexdigest(self) -> str:
+        self.pool.shutdown(wait=True)
+        return self.md5.hexdigest()
+
+    def close(self) -> None:
+        self.pool.shutdown(wait=False, cancel_futures=True)
 
 
 def gh_output(**values: str) -> None:
@@ -161,18 +227,30 @@ class Drive:
             raise Fail(f"Google rechazo GDRIVE_CREDENTIALS ({detail.rstrip('.')}).{hint}") from e
         except google.auth.exceptions.TransportError as e:
             raise Fail(f"no se pudo contactar a Google para validar las credenciales ({e})") from e
+        self.creds = creds
+        self.lock = threading.Lock()
         self.s = AuthorizedSession(creds)
+        # Varias descargas a la vez: que el pool de conexiones no las descarte.
+        adapter = HTTPAdapter(pool_maxsize=2 * WORKERS)
+        self.s.mount("https://", adapter)
+        self.s.mount("http://", adapter)
         self.account = info.get("client_email", "")
         self.folder: dict = {}
         self.free: int | None = None  # espacio libre en Mi unidad (credenciales de usuario)
 
     # --- peticiones con reintentos ------------------------------------------
+    def fresh(self) -> None:
+        """Renueva el token una sola vez aunque lo necesiten varios hilos a la vez."""
+        with self.lock:
+            if not self.creds.valid:
+                self.creds.refresh(Request())
+
     def call(self, method: str, url: str, ok=(200,), **kw) -> requests.Response:
         why = ""
         for attempt in range(RETRIES):
             try:
                 r = self.s.request(method, url, timeout=(30, 600), **kw)
-            except requests.RequestException as e:
+            except NET_ERRORS as e:
                 why = type(e).__name__
             else:
                 if r.status_code in ok:
@@ -260,7 +338,7 @@ class Drive:
         )
 
     # --- S3 -> Drive -------------------------------------------------------------
-    def upload_from_s3(self, s3, bucket: str, key: str, name: str, size: int) -> dict:
+    def upload_from_s3(self, src: S3Chunks, name: str, progress: Progress) -> dict:
         meta = {"name": name, "parents": [self.folder_id], "mimeType": SEVENZ_MIME}
         for _ in range(3):
             r = self.call(
@@ -268,10 +346,10 @@ class Drive:
                 f"{API}/upload/drive/v3/files",
                 params={"uploadType": "resumable", "supportsAllDrives": "true", "fields": FILE_FIELDS},
                 json=meta,
-                headers={"X-Upload-Content-Type": SEVENZ_MIME, "X-Upload-Content-Length": str(size)},
+                headers={"X-Upload-Content-Type": SEVENZ_MIME, "X-Upload-Content-Length": str(src.size)},
             )
             try:
-                return self._send(r.headers["Location"], s3, bucket, key, size)
+                return self._send(r.headers["Location"], src, progress)
             except SessionLost:
                 print("  la sesion de subida de Drive se perdio: se empieza de nuevo", file=sys.stderr)
         raise Fail(f"no se pudo subir {name}: Drive perdio la sesion de subida 3 veces")
@@ -281,7 +359,7 @@ class Drive:
         for attempt in range(RETRIES):
             try:
                 r = self.s.put(url, headers={"Content-Range": f"bytes */{size}"}, data=b"", timeout=(30, 120))
-            except requests.RequestException as e:
+            except NET_ERRORS as e:
                 wait(attempt, type(e).__name__)
                 continue
             if r.status_code in (200, 201):
@@ -295,68 +373,78 @@ class Drive:
             wait(attempt, f"HTTP {r.status_code}")
         raise Fail(f"Google Drive no responde tras {RETRIES} intentos")
 
-    def _send(self, url: str, s3, bucket: str, key: str, size: int) -> dict:
-        md5 = hashlib.md5()
-        offset, failures, result = 0, 0, None
-        started = last = time.monotonic()
-        while result is None:
-            if offset >= size:
-                # Drive ya tiene todo (se corto la respuesta del ultimo trozo): pedir el archivo.
-                _, result = self._status(url, size)
-                if result is None:
-                    raise SessionLost
-                break
-            end = min(offset + CHUNK, size) - 1
-            data = read_s3(s3, bucket, key, offset, end)
-            why = ""
-            try:
-                r = self.s.put(
-                    url,
-                    data=data,
-                    headers={"Content-Range": f"bytes {offset}-{end}/{size}"},
-                    timeout=(30, 600),
-                )
-            except requests.RequestException as e:
-                why = type(e).__name__
-            else:
-                if r.status_code in (200, 201):
-                    md5.update(data)
-                    result = r.json()
-                    break
-                if r.status_code == 308:
-                    done = committed(r)
-                    if not offset <= done <= end + 1:
+    def _send(self, url: str, src: S3Chunks, progress: Progress) -> dict:
+        """Un PUT por trozo, en orden: Drive no acepta partes en paralelo para
+        un archivo. Mientras sube un trozo, el siguiente ya se lee de S3."""
+        size = src.size
+        md5 = Hasher()
+        try:
+            offset, failures, result = 0, 0, None
+            while result is None:
+                if offset >= size:
+                    # Drive ya tiene todo (se corto la respuesta del ultimo trozo): pedir el archivo.
+                    _, result = self._status(url, size)
+                    if result is None:
                         raise SessionLost
-                    md5.update(data[: done - offset])
-                    offset, failures = done, 0
-                    if time.monotonic() - last > 20:
-                        last = time.monotonic()
-                        speed = offset / 1048576 / max(last - started, 0.001)
-                        print(f"  {mb(offset)} de {mb(size)} ({speed:.1f} MB/s)")
-                    continue
-                if r.status_code in (404, 410):
+                    break
+                start = offset - offset % CHUNK
+                end = min(start + CHUNK, size) - 1
+                chunk = src.get(start)
+                # Si Drive confirmo solo una parte del trozo, se manda lo que falta.
+                data = chunk if offset == start else chunk[offset - start :]
+                why = ""
+                try:
+                    r = self.s.put(
+                        url,
+                        data=data,
+                        headers={"Content-Range": f"bytes {offset}-{end}/{size}"},
+                        timeout=(30, 600),
+                    )
+                except NET_ERRORS as e:
+                    why = type(e).__name__
+                else:
+                    if r.status_code in (200, 201):
+                        md5.update(data)
+                        result = r.json()
+                        break
+                    if r.status_code == 308:
+                        done = committed(r)
+                        if not offset <= done <= end + 1:
+                            raise SessionLost
+                        md5.update(memoryview(data)[: done - offset])
+                        offset, failures = done, 0
+                        progress(offset)
+                        continue
+                    if r.status_code in (404, 410):
+                        raise SessionLost
+                    if not retryable(r):
+                        raise api_error(r, self.service_account)
+                    why = f"HTTP {r.status_code}"
+                failures += 1
+                if failures > RETRIES:
+                    raise Fail(f"Google Drive no acepta la subida tras {RETRIES} intentos ({why})")
+                wait(failures, why)
+                done, result = self._status(url, size)
+                if not offset <= done <= end + 1:
                     raise SessionLost
-                if not retryable(r):
-                    raise api_error(r, self.service_account)
-                why = f"HTTP {r.status_code}"
-            failures += 1
-            if failures > RETRIES:
-                raise Fail(f"Google Drive no acepta la subida tras {RETRIES} intentos ({why})")
-            wait(failures, why)
-            done, result = self._status(url, size)
-            if not offset <= done <= end + 1:
-                raise SessionLost
-            md5.update(data[: done - offset])
-            offset = done
-        if int(result.get("size", -1)) != size or result.get("md5Checksum") != md5.hexdigest():
-            self.delete(result["id"])
-            raise Fail("la copia en Drive no coincide con la de S3 (tamano o MD5): se borro de Drive")
-        return result
+                if done > offset:
+                    failures = 0  # Drive avanzo: los fallos no se acumulan entre trozos
+                md5.update(memoryview(data)[: done - offset])
+                offset = done
+            if int(result.get("size", -1)) != size or result.get("md5Checksum") != md5.hexdigest():
+                self.delete(result["id"])
+                raise Fail("la copia en Drive no coincide con la de S3 (tamano o MD5): se borro de Drive")
+            return result
+        finally:
+            md5.close()
 
     # --- Drive -> S3 -------------------------------------------------------------
     def read_range(self, file_id: str, start: int, end: int) -> bytes:
+        """Una parte del archivo de Drive. La llaman varios hilos a la vez."""
+        why = ""
         for attempt in range(RETRIES):
             try:
+                self.fresh()
                 r = self.s.get(
                     f"{API}/drive/v3/files/{file_id}",
                     params={"alt": "media", "supportsAllDrives": "true"},
@@ -368,10 +456,10 @@ class Drive:
                 if r.status_code not in (200, 206) and not retryable(r):
                     raise api_error(r, self.service_account)
                 why = f"HTTP {r.status_code}, {len(r.content)} bytes"
-            except requests.RequestException as e:
+            except NET_ERRORS as e:
                 why = type(e).__name__
             wait(attempt, why)
-        raise Fail(f"no se pudo descargar de Drive tras {RETRIES} intentos")
+        raise Fail(f"no se pudo descargar de Drive tras {RETRIES} intentos ({why})")
 
 
 def committed(r: requests.Response) -> int:
@@ -381,7 +469,13 @@ def committed(r: requests.Response) -> int:
     return int(m.group(1)) + 1 if m else 0
 
 
+def s3_client():
+    # Una conexion por hilo: varias lecturas o escrituras a la vez.
+    return boto3.client("s3", config=Config(max_pool_connections=2 * WORKERS))
+
+
 def read_s3(s3, bucket: str, key: str, start: int, end: int) -> bytes:
+    why = ""
     for attempt in range(RETRIES):
         try:
             data = s3.get_object(Bucket=bucket, Key=key, Range=f"bytes={start}-{end}")["Body"].read()
@@ -391,7 +485,53 @@ def read_s3(s3, bucket: str, key: str, start: int, end: int) -> bytes:
         except Exception as e:  # noqa: BLE001 - red o S3: se reintenta igual
             why = f"{type(e).__name__}: {str(e)[:200]}"
         wait(attempt, why)
-    raise Fail(f"no se pudo leer s3://{bucket}/{key} tras {RETRIES} intentos")
+    raise Fail(f"no se pudo leer s3://{bucket}/{key} tras {RETRIES} intentos ({why})")
+
+
+def write_s3_part(s3, bucket: str, key: str, upload_id: str, n: int, data: bytes) -> str:
+    why = ""
+    for attempt in range(RETRIES):
+        try:
+            return s3.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=n, Body=data)["ETag"]
+        except Exception as e:  # noqa: BLE001 - red o S3: se reintenta igual
+            why = f"{type(e).__name__}: {str(e)[:200]}"
+        wait(attempt, why)
+    raise Fail(f"no se pudo escribir en s3://{bucket}/{key} tras {RETRIES} intentos ({why})")
+
+
+class S3Chunks:
+    """El objeto de S3 en trozos de CHUNK, cada uno leido en partes de PART a
+    la vez. Al pedir un trozo ya empieza a leerse el siguiente: S3 no espera a
+    que Drive termine con el actual."""
+
+    def __init__(self, pool: ThreadPoolExecutor, s3, bucket: str, key: str, size: int) -> None:
+        self.pool, self.s3, self.bucket, self.key, self.size = pool, s3, bucket, key, size
+        self.reading: dict[int, list[Future]] = {}
+        self.cached: tuple[int, bytes] | None = None
+
+    def _read(self, start: int) -> None:
+        if start >= self.size or start in self.reading or (self.cached and self.cached[0] == start):
+            return
+        end = min(start + CHUNK, self.size)
+        self.reading[start] = [
+            self.pool.submit(read_s3, self.s3, self.bucket, self.key, a, min(a + PART, end) - 1)
+            for a in range(start, end, PART)
+        ]
+
+    def get(self, start: int) -> bytes:
+        if not (self.cached and self.cached[0] == start):
+            self._read(start)
+            parts = self.reading.pop(start)
+            self.cached = None  # suelta el trozo anterior antes de armar el nuevo
+            self.cached = (start, b"".join(p.result() for p in parts))
+        self._read(start + CHUNK)
+        return self.cached[1]
+
+    def close(self) -> None:
+        for parts in self.reading.values():
+            for p in parts:
+                p.cancel()
+        self.reading.clear()
 
 
 def s3_backups(s3, bucket: str) -> list[tuple[str, int]]:
@@ -405,7 +545,7 @@ def s3_backups(s3, bucket: str) -> list[tuple[str, int]]:
 
 
 def upload(drive: Drive, bucket: str) -> None:
-    s3 = boto3.client("s3")
+    s3 = s3_client()
     pending = s3_backups(s3, bucket)
     if not pending:
         print(f"No hay respaldos en s3://{bucket}/{PREFIX} para subir a Drive.")
@@ -413,19 +553,31 @@ def upload(drive: Drive, bucket: str) -> None:
     in_drive = {(f["name"], int(f.get("size", -1))): f for f in drive.list_backups()}
     missing = sum(size for key, size in pending if (key[len(PREFIX) :], size) not in in_drive)
     if drive.free is not None and missing > drive.free:
-        raise Fail(f"tu Google Drive no tiene espacio: hacen falta {mb(missing)} y quedan {mb(drive.free)}")
-    for key, size in pending:
-        name = key[len(PREFIX) :]
-        f = in_drive.get((name, size))
-        if f:
-            print(f"{name} ya estaba en Drive (mismo nombre y tamano)")
-        else:
-            print(f"Subiendo {name} ({mb(size)}) a Drive")
-            f = drive.upload_from_s3(s3, bucket, key, name, size)
-            print(f"En Drive: {name} ({mb(size)}), MD5 comprobado")
-        s3.delete_object(Bucket=bucket, Key=key)
-        print(f"Borrado de s3://{bucket}/{key}")
-        gh_output(name=name, size=mb(size), link=f.get("webViewLink", ""))
+        raise Fail(
+            f"tu Google Drive no tiene espacio: hacen falta {mb(missing)} y quedan {mb(max(drive.free, 0))}"
+        )
+    with ThreadPoolExecutor(WORKERS) as pool:
+        for key, size in pending:
+            name = key[len(PREFIX) :]
+            f = in_drive.get((name, size))
+            if f:
+                print(f"{name} ya estaba en Drive (mismo nombre y tamano)")
+            else:
+                print(f"Subiendo {name} ({mb(size)}) a Drive")
+                progress = Progress(size)
+                src = S3Chunks(pool, s3, bucket, key, size)
+                try:
+                    f = drive.upload_from_s3(src, name, progress)
+                finally:
+                    src.close()
+                print(f"En Drive: {name} ({mb(size)}) {progress.summary()}, MD5 comprobado")
+            s3.delete_object(Bucket=bucket, Key=key)
+            print(f"Borrado de s3://{bucket}/{key}")
+            gh_output(name=name, size=mb(size), link=f.get("webViewLink", ""))
+
+
+def ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
 
 
 def fetch(drive: Drive, bucket: str) -> None:
@@ -439,28 +591,39 @@ def fetch(drive: Drive, bucket: str) -> None:
     name, size, expected = f["name"], int(f["size"]), f.get("md5Checksum")
     key = PREFIX + name
     print(f"Respaldo mas reciente en Drive: {name} ({mb(size)}), de {len(files)}")
-    s3 = boto3.client("s3")
-    md5 = hashlib.md5()
     if size == 0:
         raise Fail(f"{name} esta vacio en Drive")
+    s3 = s3_client()
+    # S3 admite hasta 10.000 partes: con PART alcanza para 312 GB, y si no, partes mas grandes.
+    part = max(PART, ceil_div(ceil_div(size, 10000), 1048576) * 1048576)
+    todo = deque(enumerate(((a, min(a + part, size) - 1) for a in range(0, size, part)), 1))
+    progress = Progress(size)
+    md5 = hashlib.md5()
     upload_id = s3.create_multipart_upload(Bucket=bucket, Key=key, ContentType=SEVENZ_MIME)["UploadId"]
+
+    def copy(n: int, start: int, end: int) -> tuple[bytes, dict]:
+        data = drive.read_range(f["id"], start, end)
+        return data, {"PartNumber": n, "ETag": write_s3_part(s3, bucket, key, upload_id, n, data)}
+
     try:
-        parts, offset = [], 0
-        started = last = time.monotonic()
-        while offset < size:
-            end = min(offset + CHUNK, size) - 1
-            data = drive.read_range(f["id"], offset, end)
-            md5.update(data)
-            etag = s3.upload_part(
-                Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=len(parts) + 1, Body=data
-            )["ETag"]
-            parts.append({"PartNumber": len(parts) + 1, "ETag": etag})
-            offset = end + 1
-            if time.monotonic() - last > 20:
-                last = time.monotonic()
-                print(
-                    f"  {mb(offset)} de {mb(size)} ({offset / 1048576 / max(last - started, 0.001):.1f} MB/s)"
-                )
+        parts, copied = [], 0
+        with ThreadPoolExecutor(WORKERS) as pool:
+            window: deque[Future] = deque()
+            try:
+                # Varias partes a la vez; el MD5 se calcula en orden al recogerlas.
+                while todo or window:
+                    while todo and len(window) < 2 * WORKERS:
+                        n, (a, b) = todo.popleft()
+                        window.append(pool.submit(copy, n, a, b))
+                    data, info = window.popleft().result()
+                    md5.update(data)
+                    parts.append(info)
+                    copied += len(data)
+                    progress(copied)
+            except BaseException:
+                # Que terminen las partes en curso antes de abortar la subida multiparte.
+                pool.shutdown(wait=True, cancel_futures=True)
+                raise
         if expected and md5.hexdigest() != expected:
             raise Fail(f"{name} llego distinto de Drive (MD5): no se copio a S3")
         s3.complete_multipart_upload(
@@ -469,11 +632,13 @@ def fetch(drive: Drive, bucket: str) -> None:
     except BaseException:
         s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
         raise
-    print(f"Copiado a s3://{bucket}/{key}, MD5 comprobado")
+    print(f"Copiado a s3://{bucket}/{key} {progress.summary()}, MD5 comprobado")
     gh_output(name=name, size=mb(size), link=f.get("webViewLink", ""))
 
 
 def main() -> None:
+    # Una linea a la vez aunque la salida no sea una terminal: el avance se ve en vivo en Actions.
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -487,8 +652,14 @@ def main() -> None:
             if not args.bucket:
                 raise Fail("falta el bucket (--bucket o ARTIFACTS_BUCKET)")
             (upload if args.command == "upload" else fetch)(drive, args.bucket)
-    except Fail as e:
-        print(f"::error::{e}" if os.environ.get("GITHUB_ACTIONS") else f"ERROR: {e}", file=sys.stderr)
+    except (Fail, google.auth.exceptions.RefreshError, BotoCoreError, ClientError) as e:
+        if isinstance(e, Fail):
+            msg = str(e)
+        elif isinstance(e, google.auth.exceptions.RefreshError):
+            msg = f"Google dejo de aceptar GDRIVE_CREDENTIALS durante la copia ({e})"
+        else:
+            msg = f"AWS respondio con un error ({e}). Si la sesion del lab termino, actualiza los secrets de AWS."
+        print(f"::error::{msg}" if os.environ.get("GITHUB_ACTIONS") else f"ERROR: {msg}", file=sys.stderr)
         sys.exit(1)
 
 

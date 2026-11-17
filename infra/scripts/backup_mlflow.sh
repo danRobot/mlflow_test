@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
 # backup_mlflow.sh - Respaldo de MLflow: la base (PostgreSQL) y los
-# artefactos en un solo .7z con la maxima compresion, en la carpeta backup/
+# artefactos en un solo .7z con la compresion mas rapida, en la carpeta backup/
 # del bucket. Corre en la EC2, como root; lo lanza el workflow backup por SSM,
 # que despues sube el .7z a Google Drive y lo borra de S3.
 #
@@ -127,13 +127,10 @@ read -r ART_FILES ART_BYTES <<<"${SUMMARY}"
 # para no dejar sin disco a Postgres y MLflow.
 need_space "${WORK_BASE}" $((ART_BYTES + DB_BYTES + 536870912)) "armar el .7z"
 
-# 7-Zip con la minima compresion (-mx=1). En 7-Zip 2x usa un diccionario de
-# 256 MB y unos 2.2 GB de RAM; si no hay tanta memoria libre (t3.small), se
-# baja a 64 MB: unos 0.7 GB y un .7z practicamente igual.
+# 7-Zip con la compresion mas rapida (-mx=1): diccionario de 256 KB y poca
+# memoria. No agrandar el diccionario (-md): con -mx=1 y datos que casi no se
+# comprimen, como los modelos, -md=64m es unas 10 veces mas lento.
 SZ_OPTS=(-t7z -mx=1 -bd)
-if [ "$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)" -lt $((3 * 1024 * 1024)) ]; then
-    SZ_OPTS+=(-md=64m)
-fi
 
 # --- Base y manifiesto, directo a S3 ---------------------------------------------
 STAGED=yes

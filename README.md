@@ -99,19 +99,19 @@ manifest.txt    fecha, versión de MLflow y conteos
 artifacts/      copia de s3://<bucket>/artifacts
 ```
 
-Después el runner de GitHub lo pasa de S3 a la carpeta de Drive en partes de 32 MB (sin guardarlo en su disco), comprueba que el MD5 que calcula Drive coincida con el de S3 y lo borra de S3. El resumen del run trae el enlace al archivo en Drive.
+Después el runner de GitHub lo pasa de S3 a la carpeta de Drive sin guardarlo en su disco: sube trozos de 128 MB mientras ya lee de S3 el siguiente. Al terminar comprueba que el MD5 que calcula Drive coincida con el de S3 y lo borra de S3. Mientras sube, el paso **Subir a Google Drive** muestra cada 15 s lo copiado, la velocidad y cuánto falta; el resumen del run trae el enlace al archivo en Drive.
 
 - **Sin llenar el disco de la EC2** (20 GB): la base se vuelca directo a S3, a una carpeta temporal `backup/backup_mlflow_<fecha>.tmp/`, y 7-Zip lee la base y los artefactos del bucket montado ([Mountpoint for Amazon S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mountpoint.html), en solo lectura y solo mientras dura el respaldo). En el disco solo se arma el `.7z`, porque 7-Zip necesita volver atrás en el archivo que escribe. Cuando el `.7z` está en `backup/`, se borran la copia del disco y la carpeta temporal.
 - Antes de empezar comprueba que el `.7z` quepa en el disco aunque nada se comprima; si no, falla sin tocar nada.
 - Con la base vacía (MLflow recién desplegado) no crea ningún respaldo: sería el más reciente y el restore lo tomaría antes que tus datos.
-- Comprimir al máximo es lento: del orden de 5 MB por segundo de datos sin comprimir. Los modelos binarios casi no se comprimen; los CSV, los JSON y la base, mucho.
+- La compresión es la más rápida de 7-Zip (`-mx=1`). Los modelos binarios casi no se comprimen con ningún nivel; los CSV, los JSON y la base quedan algo más grandes que con la máxima. Mientras 7-Zip trabaja, el paso de SSM muestra los minutos que lleva; la salida del script aparece al terminar.
 - Si el workflow encendió la EC2, la vuelve a detener antes de subir a Drive, que no la necesita.
 - Si la subida a Drive falla (Drive lleno, permiso revocado), el `.7z` se queda en `backup/` y el siguiente backup lo sube junto con el nuevo. Un destroy antes de eso lo borraría.
 - Cada respaldo es completo e independiente, y no se borran solos: elimina desde Drive los que ya no quieras. Ocupan espacio de la cuenta de `GDRIVE_CREDENTIALS` (15 GB gratis en Gmail, compartidos con el correo y Fotos); si no cabe, backup falla antes de subir.
 
 ### Restaurar
 
-**Actions → restore → Run workflow**, escribiendo `restaurar`. Toma de la carpeta de Drive el `.7z` más reciente (por la fecha del nombre) y lo copia a `backup/` comprobando el MD5. La EC2 lo descomprime, sube los artefactos a S3, **reemplaza** la base actual por la del respaldo y levanta MLflow. Al final, salga bien o mal, se borra la copia de S3. En Drive no se borra nada.
+**Actions → restore → Run workflow**, escribiendo `restaurar`. Toma de la carpeta de Drive el `.7z` más reciente (por la fecha del nombre) y lo copia a `backup/` por 8 conexiones a la vez, comprobando el MD5; el paso **Copiar de Google Drive a S3** muestra el avance. La EC2 lo descomprime, sube los artefactos a S3, **reemplaza** la base actual por la del respaldo y levanta MLflow. Al final, salga bien o mal, se borra la copia de S3. En Drive no se borra nada.
 
 - **Instalación limpia** (después de un destroy o un reinicio del lab): lanza deploy y después restore. Si la carpeta de Drive no tiene ningún `.7z`, restore falla antes de encender la EC2.
 - **Para restaurar uno anterior**, saca de la carpeta los más nuevos (muévelos a otra carpeta de Drive) y lanza restore. También sirve un `.7z` que subas tú a la carpeta, con su nombre `backup_mlflow_<fecha>.7z`.
