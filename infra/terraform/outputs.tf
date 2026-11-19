@@ -30,6 +30,21 @@ output "log_group" {
   value       = aws_cloudwatch_log_group.ec2.name
 }
 
+output "pruebas_instance_id" {
+  description = "EC2 de pruebas (vacio con la variable PRUEBAS en N)"
+  value       = try(aws_instance.pruebas[0].id, "")
+}
+
+output "pruebas_env_parameter" {
+  description = "Parametro SSM con los secretos de la EC2 de pruebas"
+  value       = try(aws_ssm_parameter.pruebas_env[0].name, "")
+}
+
+output "pruebas_sa_parameter" {
+  description = "Parametro SSM con la llave de la service account de DVC (vacio sin el secret GDRIVE_JSON)"
+  value       = try(aws_ssm_parameter.pruebas_sa[0].name, "")
+}
+
 output "server_log_group" {
   description = "Log group de CloudWatch con la salida de MLflow: accesos con IP remota y errores"
   value       = aws_cloudwatch_log_group.server.name

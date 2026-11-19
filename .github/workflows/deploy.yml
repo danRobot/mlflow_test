@@ -1,6 +1,8 @@
 name: deploy
 
 # Etapas: config -> terraform -> build (imagen en ECR) -> deploy (EC2 por SSM)
+# Aparte, despues de terraform: pruebas (prepara la EC2 de pruebas; nunca hace
+# fallar el deploy de MLflow).
 on:
   workflow_dispatch:
 
@@ -30,6 +32,8 @@ jobs:
     timeout-minutes: 5
     outputs:
       auth: ${{ steps.auth.outputs.enabled }}
+      pruebas: ${{ steps.pruebas.outputs.enabled }}
+      pruebas_sa: ${{ steps.pruebas.outputs.sa }}
     steps:
       - name: Secret POSTGRES_PASSWORD
         run: |
@@ -76,6 +80,55 @@ jobs:
             echo "MLflow sin autenticacion."
           fi
 
+      # EC2 de pruebas (ver README). Se crea salvo con la variable PRUEBAS en
+      # N. Aqui solo se avisa: un secret que falte deja sin esa variable a la
+      # EC2 de pruebas, pero no detiene el deploy.
+      - name: EC2 de pruebas
+        id: pruebas
+        env:
+          PRUEBAS: ${{ vars.PRUEBAS }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MLFLOW_USER: ${{ secrets.MLFLOW_USER }}
+          MLFLOW_AUTH_PASSWORD: ${{ secrets.MLFLOW_AUTH_PASSWORD }}
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          ID_CARPETA: ${{ secrets.ID_CARPETA }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_JSON: ${{ secrets.GDRIVE_JSON }}
+        run: |
+          valor=$(tr -d '[:space:]' <<<"$PRUEBAS" | tr '[:lower:]' '[:upper:]')
+          case "$valor" in
+            S | "") enabled=true ;;
+            N) enabled=false ;;
+            *) echo "::warning::La variable PRUEBAS debe ser S o N (es '$PRUEBAS'): se toma S."; enabled=true ;;
+          esac
+          sa=false
+          if [ "$enabled" = true ]; then
+            faltan=()
+            for s in HF_TOKEN MLFLOW_USER MLFLOW_AUTH_PASSWORD RUNPOD_API_KEY ID_CARPETA \
+                GDRIVE_CLIENT_ID GDRIVE_CLIENT_SECRET GDRIVE_JSON; do
+              [ -n "${!s}" ] || faltan+=("$s")
+            done
+            if [ "${#faltan[@]}" -gt 0 ]; then
+              echo "::warning::EC2 de pruebas: faltan los secrets ${faltan[*]} (sus variables no quedan en ~/.bashrc)."
+            fi
+            # Parameter Store estandar guarda hasta 4 KB.
+            if [ -n "$GDRIVE_JSON" ]; then
+              if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$GDRIVE_JSON"; then
+                echo "::warning::El secret GDRIVE_JSON no es un JSON valido: no se copia a la EC2 de pruebas."
+              elif [ "$(printf %s "$GDRIVE_JSON" | wc -c)" -gt 4096 ]; then
+                echo "::warning::El secret GDRIVE_JSON pasa de 4 KB: no se copia a la EC2 de pruebas."
+              else
+                sa=true
+              fi
+            fi
+            echo "EC2 de pruebas: se crea o actualiza."
+          else
+            echo "EC2 de pruebas: no (variable PRUEBAS en N); si existia, se borra."
+          fi
+          echo "enabled=${enabled}" >> "$GITHUB_OUTPUT"
+          echo "sa=${sa}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v7
       - uses: ./.github/actions/aws-setup
 
@@ -110,6 +163,9 @@ jobs:
     env:
       TF_VAR_mlflow_auth_enabled: ${{ needs.config.outputs.auth }}
       TF_VAR_mlflow_auth: ${{ needs.config.outputs.auth == 'true' && format('{0}:{1}', secrets.MLFLOW_USER, secrets.MLFLOW_AUTH_PASSWORD) || '' }}
+      TF_VAR_pruebas_enabled: ${{ needs.config.outputs.pruebas }}
+      TF_VAR_pruebas_sa_enabled: ${{ needs.config.outputs.pruebas_sa }}
+      TF_VAR_pruebas_sa_json: ${{ needs.config.outputs.pruebas_sa == 'true' && secrets.GDRIVE_JSON || '' }}
     outputs:
       instance_id: ${{ steps.apply.outputs.instance_id }}
       public_ip: ${{ steps.apply.outputs.public_ip }}
@@ -117,6 +173,9 @@ jobs:
       auth_parameter: ${{ steps.apply.outputs.auth_parameter }}
       log_group: ${{ steps.apply.outputs.log_group }}
       server_log_group: ${{ steps.apply.outputs.server_log_group }}
+      pruebas_instance_id: ${{ steps.apply.outputs.pruebas_instance_id }}
+      pruebas_env_parameter: ${{ steps.apply.outputs.pruebas_env_parameter }}
+      pruebas_sa_parameter: ${{ steps.apply.outputs.pruebas_sa_parameter }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/aws-setup
@@ -129,12 +188,38 @@ jobs:
       - name: Terraform apply
         id: apply
         working-directory: infra/terraform
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MLFLOW_USER: ${{ secrets.MLFLOW_USER }}
+          MLFLOW_AUTH_PASSWORD: ${{ secrets.MLFLOW_AUTH_PASSWORD }}
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          ID_CARPETA: ${{ secrets.ID_CARPETA }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
         run: |
+          # Secretos de la EC2 de pruebas en un JSON, con el nombre de la
+          # variable de entorno que tendran alla; los vacios no van.
+          TF_VAR_pruebas_env=$(jq -cn \
+            --arg HF_TOKEN "$HF_TOKEN" \
+            --arg MLFLOW_TRACKING_USERNAME "$MLFLOW_USER" \
+            --arg MLFLOW_TRACKING_PASSWORD "$MLFLOW_AUTH_PASSWORD" \
+            --arg RUNPOD_API_KEY "$RUNPOD_API_KEY" \
+            --arg ID_CARPETA "$ID_CARPETA" \
+            --arg GDRIVE_CLIENT_ID "$GDRIVE_CLIENT_ID" \
+            --arg GDRIVE_CLIENT_SECRET "$GDRIVE_CLIENT_SECRET" \
+            '$ARGS.named | with_entries(select(.value != ""))')
+          if [ "${#TF_VAR_pruebas_env}" -gt 4096 ]; then
+            echo "::warning::Los secrets de la EC2 de pruebas pasan de 4 KB: no se copian."
+            TF_VAR_pruebas_env='{}'
+          fi
+          export TF_VAR_pruebas_env
+
           terraform init -input=false \
             -backend-config="bucket=${TF_STATE_BUCKET}" \
             -backend-config="region=${AWS_REGION}"
           terraform apply -input=false -auto-approve
-          for name in instance_id public_ip postgres_parameter auth_parameter log_group server_log_group; do
+          for name in instance_id public_ip postgres_parameter auth_parameter log_group server_log_group \
+              pruebas_instance_id pruebas_env_parameter pruebas_sa_parameter; do
             echo "${name}=$(terraform output -raw "$name")" >> "$GITHUB_OUTPUT"
           done
 
@@ -218,3 +303,67 @@ jobs:
             echo "Respaldos: **Actions → backup** los guarda en Google Drive; **Actions → restore** recupera el mas reciente."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # EC2 de pruebas: corre en paralelo con build y deploy, y nunca hace fallar el
+  # workflow. Lo que no salga bien queda como aviso en el resumen del run.
+  pruebas:
+    needs: terraform
+    if: needs.terraform.outputs.pruebas_instance_id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      INSTANCE_ID: ${{ needs.terraform.outputs.pruebas_instance_id }}
+      PUBLIC_IP: ${{ needs.terraform.outputs.public_ip }}
+      ENV_PARAMETER: ${{ needs.terraform.outputs.pruebas_env_parameter }}
+      SA_PARAMETER: ${{ needs.terraform.outputs.pruebas_sa_parameter }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/aws-setup
+
+      - name: Comando de preparacion
+        id: cmd
+        run: |
+          # El script viaja dentro del comando, en base64: la EC2 nueva aun no
+          # tiene la AWS CLI para bajarlo de S3. Lleva solo datos publicos; los
+          # secretos los lee de Parameter Store.
+          script=$(base64 -w0 infra/pruebas/preparar.sh)
+          cmd="mkdir -p /opt/pruebas && echo ${script} | base64 -d > /opt/pruebas/preparar.sh"
+          cmd+=" && printf '%s\n' 'MLFLOW_TRACKING_URI=http://${PUBLIC_IP}:8080' 'ENV_PARAMETER=${ENV_PARAMETER}'"
+          cmd+=" 'SA_PARAMETER=${SA_PARAMETER}' 'AWS_REGION=${AWS_REGION}' 'INSTANCE_ID=${INSTANCE_ID}' > /opt/pruebas/config"
+          cmd+=" && bash /opt/pruebas/preparar.sh"
+          echo "command=${cmd}" >> "$GITHUB_OUTPUT"
+
+      - name: Preparar la EC2 de pruebas (SSM)
+        id: run
+        continue-on-error: true
+        uses: ./.github/actions/ssm-run
+        with:
+          instance-id: ${{ env.INSTANCE_ID }}
+          command: ${{ steps.cmd.outputs.command }}
+          comment: EC2 de pruebas ${{ github.sha }}
+          timeout-minutes: 20
+
+      - name: Resumen
+        if: always()
+        env:
+          OUTCOME: ${{ steps.run.outcome }}
+          OUTPUT: ${{ steps.run.outputs.output }}
+        run: |
+          # Cada AVISO del script queda como anotacion del run (sin hacerlo fallar).
+          { grep '^AVISO: ' <<<"$OUTPUT" || true; } | while IFS= read -r linea; do
+            echo "::warning title=EC2 de pruebas::${linea#AVISO: }"
+          done
+          {
+            echo "### EC2 de pruebas: \`${INSTANCE_ID}\`"
+            if [ "$OUTCOME" = success ]; then
+              echo '```'
+              grep -E '^(colab --help|runpodctl pod list|Memoria|Disco|LISTO)' <<<"$OUTPUT" || true
+              echo '```'
+            else
+              echo "**No quedo lista**: el detalle esta en el paso *Preparar la EC2 de pruebas*. MLflow no se ve afectado."
+            fi
+            echo "Entrar: EC2 > \`mlflow-pruebas\` > Connect > Session Manager, y luego \`sudo -iu ubuntu\`."
+            echo "Colab se autentica una vez a mano: \`colab sessions\`, abre el enlace y pega el codigo."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != success ]; then
+            echo "::warning title=EC2 de pruebas::No quedo lista (ver el paso anterior). MLflow no se ve afectado."
+          fi

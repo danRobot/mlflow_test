@@ -58,3 +58,36 @@ variable "mlflow_auth" {
   default     = ""
   sensitive   = true
 }
+
+# --- EC2 de pruebas (otro proyecto; ver README) ---------------------------------
+variable "pruebas_enabled" {
+  description = "EC2 de pruebas. La decide el workflow de deploy: con la variable PRUEBAS en N no se crea (o se borra)."
+  type        = bool
+  default     = true
+}
+
+variable "pruebas_instance_type" {
+  description = "1 GB de RAM: con 512 MB (nano) el primer arranque de Ubuntu mas las instalaciones se quedan sin memoria"
+  type        = string
+  default     = "t3.micro"
+}
+
+variable "pruebas_env" {
+  description = "JSON con los secretos de la EC2 de pruebas (HF_TOKEN, RUNPOD_API_KEY, ...). Lo arma el workflow de deploy."
+  type        = string
+  default     = "{}"
+  sensitive   = true
+}
+
+variable "pruebas_sa_enabled" {
+  description = "Hay llave de la service account de DVC (secret GDRIVE_JSON). La decide el workflow de deploy."
+  type        = bool
+  default     = false
+}
+
+variable "pruebas_sa_json" {
+  description = "Contenido de evidencitedvc-sa.json (secret GDRIVE_JSON). Solo se usa con pruebas_sa_enabled."
+  type        = string
+  default     = ""
+  sensitive   = true
+}

@@ -28,10 +28,20 @@ data "aws_ec2_instance_type_offerings" "this" {
   }
 }
 
+data "aws_ec2_instance_type_offerings" "pruebas" {
+  location_type = "availability-zone"
+
+  filter {
+    name   = "instance-type"
+    values = [var.pruebas_instance_type]
+  }
+}
+
 locals {
   az = sort(setintersection(
     data.aws_availability_zones.available.names,
     data.aws_ec2_instance_type_offerings.this.locations,
+    data.aws_ec2_instance_type_offerings.pruebas.locations,
   ))[0]
 }
 
@@ -196,6 +206,92 @@ resource "aws_eip" "mlflow" {
   tags     = { Name = "${var.project}-server" }
 
   depends_on = [aws_internet_gateway.this]
+}
+
+# ---------------------------------------------------------------------------
+# EC2 de pruebas de otro proyecto (EvidenCite): Ubuntu 24.04, usuario ubuntu,
+# se entra por SSM igual que a la de MLflow. La prepara el workflow de deploy
+# con infra/pruebas/preparar.sh; nada de esto toca el servidor de MLflow.
+# Con la variable PRUEBAS en N, deploy no la crea (o la borra).
+# ---------------------------------------------------------------------------
+data "aws_ami" "ubuntu" {
+  count       = var.pruebas_enabled ? 1 : 0
+  most_recent = true
+  owners      = ["099720109477"] # Canonical: trae el agente de SSM
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+  }
+}
+
+# Sin puertos abiertos: solo SSM, que sale hacia AWS.
+resource "aws_security_group" "pruebas" {
+  count       = var.pruebas_enabled ? 1 : 0
+  name        = "${var.project}-pruebas"
+  description = "EC2 de pruebas, sin entradas (se usa por SSM)"
+  vpc_id      = aws_vpc.this.id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Secretos para ~/.bashrc y la llave de DVC. Write-only, como los de MLflow: no
+# quedan en el estado. preparar.sh los lee con el rol de la instancia.
+resource "aws_ssm_parameter" "pruebas_env" {
+  count            = var.pruebas_enabled ? 1 : 0
+  name             = "/${var.project}/pruebas/env"
+  type             = "SecureString"
+  value_wo         = var.pruebas_env
+  value_wo_version = parseint(substr(sha256(var.pruebas_env), 0, 8), 16)
+}
+
+resource "aws_ssm_parameter" "pruebas_sa" {
+  count            = var.pruebas_enabled && var.pruebas_sa_enabled ? 1 : 0
+  name             = "/${var.project}/pruebas/gdrive-sa"
+  type             = "SecureString"
+  value_wo         = var.pruebas_sa_json
+  value_wo_version = parseint(substr(sha256(var.pruebas_sa_json), 0, 8), 16)
+}
+
+resource "aws_instance" "pruebas" {
+  count                  = var.pruebas_enabled ? 1 : 0
+  ami                    = data.aws_ami.ubuntu[0].id
+  instance_type          = var.pruebas_instance_type
+  subnet_id              = aws_subnet.public.id # IP publica propia para llegar a SSM; sin IP elastica
+  vpc_security_group_ids = [aws_security_group.pruebas[0].id]
+  iam_instance_profile   = var.instance_profile
+
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  # 8 GB es el minimo de la AMI. Ubuntu, la AWS CLI, colab, runpodctl, el repo
+  # y 1 GB de swap ocupan unos 4 GB.
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = 8
+    encrypted   = true
+  }
+
+  tags = { Name = "${var.project}-pruebas" }
+
+  # Una AMI nueva no debe recrearla: se perderia lo que haya en el disco.
+  lifecycle {
+    ignore_changes = [ami]
+  }
+}
+
+# Como la de MLflow: el Learner Lab la detiene al terminar la sesion y cada
+# deploy la vuelve a encender.
+resource "aws_ec2_instance_state" "pruebas" {
+  count       = var.pruebas_enabled ? 1 : 0
+  instance_id = aws_instance.pruebas[0].id
+  state       = "running"
 }
 
 # ---------------------------------------------------------------------------

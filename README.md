@@ -6,6 +6,7 @@
 | **EC2** | Amazon Linux 2023 con Docker Compose: MLflow + Postgres. Usa el `LabInstanceProfile` del lab (el Learner Lab no deja crear roles). Sin SSH: el deploy entra por SSM. |
 | **S3** | Modelos y artefactos de MLflow (`s3://<bucket>/artifacts`) y estado de Terraform. |
 | **Respaldos** | La base y los artefactos en un solo `.7z`, guardado en una carpeta de Google Drive, fuera de AWS. Ver [Respaldos en Google Drive](#respaldos-en-google-drive). |
+| **EC2 de pruebas** | Ubuntu 24.04 para otro proyecto (EvidenCite), con Colab CLI, runpodctl y el repo listos. Aparte del servidor de MLflow. Ver [EC2 de pruebas](#ec2-de-pruebas). |
 
 No hay bootstrap: el workflow de deploy crea con la AWS CLI los dos buckets (estado y artefactos) si no existen, y el de destroy los borra al final. No los gestiona Terraform porque el provider de AWS lee siempre la configuración de Object Lock de los buckets y la política del Learner Lab lo prohíbe. (`infra/bootstrap` e `infra/unapply.sh` son de la versión para una cuenta de AWS normal, con un rol que GitHub asume por OIDC; en el Learner Lab no se usan.)
 
@@ -17,6 +18,8 @@ En **Settings → Secrets and variables → Actions**:
 - **Secret** `POSTGRES_PASSWORD`: clave del usuario `mlflow` de Postgres (al menos 8 caracteres; solo letras, números y `. _ ~ -`, porque va dentro de la URL de conexión). Lo exige el deploy. No sirve para entrar a MLflow.
 - **Opcional, para que MLflow pida usuario y clave**: la **variable** `AUTH` en `S` y los **secrets** `MLFLOW_USER` (letras, números y `. _ @ -`) y `MLFLOW_AUTH_PASSWORD` (12 caracteres o más, lo exige MLflow). Ver [Autenticación de MLflow](#autenticación-de-mlflow).
 - **Secrets** `GDRIVE_FOLDER_ID` y `GDRIVE_CREDENTIALS`, para los respaldos: la carpeta de Google Drive y las credenciales que entran a ella. Los piden backup y restore. Ver [Configurar Google Drive](#configurar-google-drive).
+- **Secrets de la EC2 de pruebas** `HF_TOKEN`, `RUNPOD_API_KEY`, `ID_CARPETA`, `GDRIVE_CLIENT_ID`, `GDRIVE_CLIENT_SECRET` y `GDRIVE_JSON`. Usa además `MLFLOW_USER` y `MLFLOW_AUTH_PASSWORD`. Si falta alguno, deploy avisa y sigue. Ver [EC2 de pruebas](#ec2-de-pruebas).
+- **Variable opcional** `PRUEBAS`: `N` para no tener la EC2 de pruebas (si existía, deploy la borra). Sin la variable, o en `S`, se crea.
 - **Variable opcional** `AWS_REGION`: `us-east-1` (por defecto) o `us-west-2`, las únicas que permite el lab.
 
 ## 2. En cada sesión del lab
@@ -29,8 +32,8 @@ Las credenciales cambian cada vez que inicias el lab y caducan cuando termina la
 
 ## 3. Desplegar y destruir
 
-- **Actions → deploy → Run workflow**: etapas `config` (credenciales, buckets y la carpeta de paso `backup/`) → `terraform` → `build` (imagen en ECR) → `deploy` (EC2 por SSM). La URL aparece en el resumen del run. Si la sesión anterior detuvo la EC2, el deploy la vuelve a encender.
-- **Actions → destroy → Run workflow**, escribiendo `destroy`: etapas `config` → `terraform` → `limpieza`. Borra todo en AWS, incluidos runs, métricas, modelos, imágenes, logs, los parámetros de Parameter Store que creó Terraform y el bucket del estado. La cuenta queda vacía. Los respaldos de Google Drive no se tocan: lanza antes backup para guardar lo último.
+- **Actions → deploy → Run workflow**: etapas `config` (credenciales, buckets y la carpeta de paso `backup/`) → `terraform` → `build` (imagen en ECR) → `deploy` (EC2 por SSM). En paralelo con `build` y `deploy`, la etapa `pruebas` prepara la [EC2 de pruebas](#ec2-de-pruebas). La URL aparece en el resumen del run. Si la sesión anterior detuvo las EC2, el deploy las vuelve a encender.
+- **Actions → destroy → Run workflow**, escribiendo `destroy`: etapas `config` → `terraform` → `limpieza`. Borra todo en AWS, incluidos runs, métricas, modelos, la EC2 de pruebas con su disco, imágenes, logs, los parámetros de Parameter Store que creó Terraform y el bucket del estado. La cuenta queda vacía. Los respaldos de Google Drive no se tocan: lanza antes backup para guardar lo último.
 - **Actions → backup** y **Actions → restore**: ver [Respaldos en Google Drive](#respaldos-en-google-drive).
 
 Si reinicias el lab sin hacer destroy, el reinicio puede borrar el estado de Terraform y dejar parámetros como `/mlflow/postgres-password`. Entonces deploy falla con `ParameterAlreadyExists`. Lanza destroy una vez: busca los parámetros por las etiquetas que pone Terraform (`Project=mlflow`, `ManagedBy=terraform`) y los borra aunque no haya estado. El siguiente deploy los vuelve a crear a partir de los secrets. Los parámetros sin esas etiquetas, que no son de este proyecto, no se tocan.
@@ -57,6 +60,57 @@ mlflow.set_tracking_uri("http://<IP>:8080")
 ```
 
 Sin ellas, cualquier llamada falla con `401` ("You are not authenticated"). `/health` no pide clave, así que el healthcheck sigue funcionando.
+
+## EC2 de pruebas
+
+Una segunda EC2, para otro proyecto ([EvidenCite](https://github.com/d-leandro/EvidenCite)). Comparte la red del stack y nada más: no toca el servidor de MLflow, y si algo falla al prepararla el deploy de MLflow termina igual (queda como aviso en el resumen del run).
+
+- **Máquina:** Ubuntu 24.04, `t3.micro` (2 vCPU, 1 GB de RAM), disco de 8 GB y 1 GB de swap. Sin puertos abiertos ni IP elástica.
+- **Cómo se entra:** igual que a la de MLflow, por SSM: **EC2 → `mlflow-pruebas` → Connect → Session Manager**, y luego `sudo -iu ubuntu`.
+- **Encendido:** el lab la detiene al terminar la sesión y cada deploy la vuelve a encender. Destroy la borra con todo lo que tenga en el disco.
+
+### Qué deja lista
+
+Cada deploy corre `infra/pruebas/preparar.sh` en la EC2, como root (queda en `/opt/pruebas/preparar.sh`; para repetirlo a mano, `sudo bash /opt/pruebas/preparar.sh`). Para el usuario `ubuntu`:
+
+- **Herramientas:** la [Google Colab CLI](https://github.com/googlecolab/google-colab-cli) (`colab`, instalada con uv en `~/.local/bin`), [runpodctl](https://docs.runpod.io/runpodctl/overview) en `/usr/local/bin` y la AWS CLI.
+- **Llave SSH:** `~/.ssh/id_ed25519`, creada con `ssh-keygen`.
+  - `colab ssh` la usa sin opciones.
+  - Se registra en tu cuenta de RunPod (`runpodctl ssh add-key`), así que los pods nuevos la aceptan.
+- **El repo:** EvidenCite en `~/EvidenCite`. En los deploys siguientes solo se actualizan las ramas remotas (`git fetch`); tu copia de trabajo no se toca.
+- **Variables de entorno:** al principio de `~/.bashrc`, antes del corte para shells no interactivas, así también las ven los comandos por SSH. El archivo queda solo para `ubuntu`.
+
+| Variable | De dónde sale |
+|---|---|
+| `HF_TOKEN`, `RUNPOD_API_KEY`, `ID_CARPETA`, `GDRIVE_CLIENT_ID`, `GDRIVE_CLIENT_SECRET` | El secret del mismo nombre |
+| `MLFLOW_TRACKING_USERNAME`, `MLFLOW_TRACKING_PASSWORD` | Los secrets `MLFLOW_USER` y `MLFLOW_AUTH_PASSWORD` |
+| `MLFLOW_TRACKING_URI`, `IP_MLFLOW`, `MLFLOW_IP` | `http://<IP elástica de MLflow>:8080`, del deploy |
+| `GDRIVE_SA_JSON` | `~/claves/evidencitedvc-sa.json`, con el contenido del secret `GDRIVE_JSON` |
+
+Si falta un secret, su variable no se escribe y el deploy avisa cuál falta. `GDRIVE_JSON` debe ser un JSON válido de hasta 4 KB (el límite de Parameter Store); una llave de service account normal pesa unos 2.3 KB.
+
+Al final comprueba `colab --help` y `runpodctl pod list` (con `RUNPOD_API_KEY`). Si alguno falla, solo queda un aviso: el deploy no falla por eso.
+
+**Colab se autentica una vez, a mano:** como `ubuntu`, corre `colab sessions`, abre el enlace que muestra, autoriza y pega el código.
+
+### Cómo viajan los secretos
+
+Terraform guarda los secrets en Parameter Store como SecureString, sin dejarlos en su estado (igual que la clave de Postgres): `/mlflow/pruebas/env` y `/mlflow/pruebas/gdrive-sa`. El script los lee con el rol de la instancia y no los imprime. Destroy los borra.
+
+La llave que se registró en RunPod sigue allá después de un destroy. El siguiente deploy crea una EC2 nueva con otra llave; las viejas, que llevan `mlflow-pruebas-<id de la instancia>` como comentario, se borran con `runpodctl ssh list-keys` y `runpodctl ssh remove-key --fingerprint ...`.
+
+### Tamaño
+
+| | Memoria (RSS) |
+|---|---|
+| Ubuntu con el agente de SSM, en reposo | unos 250–350 MB (estimado) |
+| Preparación (pico: uv instalando Colab CLI) | unos 120 MB |
+| `colab --help` | unos 75 MB |
+| `runpodctl` | menos de 20 MB |
+
+Con 512 MB (`t3.nano`) no alcanza: el primer arranque de Ubuntu (cloud-init, snap y las actualizaciones automáticas, que corren apt) coincide con las instalaciones y se queda sin memoria. Con 1 GB y la swap queda margen. En disco, Ubuntu ocupa unos 2.5 GB, y la AWS CLI, Colab CLI, runpodctl, el repo y la swap suman otros 1.5 GB: los 8 GB (el mínimo de la AMI) sobran.
+
+Costo: `t3.micro` cuesta unos US$0.0104 por hora encendida, más US$0.005 por hora por la IP pública. El disco de 8 GB cuesta US$0.64 al mes, aunque la EC2 esté detenida.
 
 ## Respaldos en Google Drive
 

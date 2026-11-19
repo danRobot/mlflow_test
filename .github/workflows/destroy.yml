@@ -2,10 +2,12 @@ name: destroy
 
 # Etapas: config -> terraform (destroy) -> limpieza
 # Borra TODO en AWS: servidor, base de datos (runs y metricas), modelos en S3,
-# la carpeta de paso s3://<bucket>/backup/, imagenes en ECR, logs, los
-# parametros de Parameter Store que creo Terraform y el bucket del estado. La
-# cuenta queda vacia. Los respaldos de Google Drive no se tocan: lanza antes
-# backup para guardar lo ultimo.
+# la EC2 de pruebas con su disco, la carpeta de paso s3://<bucket>/backup/,
+# imagenes en ECR, logs, los parametros de Parameter Store que creo Terraform
+# (tambien los secretos de la EC2 de pruebas) y el bucket del estado. La cuenta
+# queda vacia. Los respaldos de Google Drive no se tocan: lanza antes backup
+# para guardar lo ultimo. Fuera de AWS queda la llave SSH que la EC2 de pruebas
+# registro en RunPod (se borra a mano: runpodctl ssh remove-key).
 on:
   workflow_dispatch:
     inputs:
